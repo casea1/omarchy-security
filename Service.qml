@@ -33,6 +33,18 @@ Item {
   property var systemIntegrity: null
   property var userIntegrity: null
 
+  // Seeded rather than left blank so a slow or failed manifest read cannot
+  // make a stale collector look current.
+  property string pluginVersion: "1.0.0"
+  readonly property string systemCollectorVersion:
+    systemStatus && systemStatus.collectorVersion ? systemStatus.collectorVersion : ""
+
+  // A plugin update refreshes the scripts in this directory but cannot touch
+  // the root-installed copies, so say when they have drifted apart rather
+  // than quietly serving data from an old collector.
+  readonly property bool collectorOutdated: systemCollectorInstalled
+    && pluginVersion !== "" && systemCollectorVersion !== pluginVersion
+
   property int nowUnix: Math.floor(Date.now() / 1000)
   property int lastSelfAuditUnix: 0
   property bool selfCollecting: false
@@ -236,6 +248,17 @@ Item {
   }
 
   // ---- sources ----------------------------------------------------------
+
+  FileView {
+    path: root.stripScheme(Qt.resolvedUrl("manifest.json"))
+    printErrors: false
+    onLoaded: {
+      try {
+        var v = JSON.parse(text()).version
+        if (v) root.pluginVersion = v
+      } catch (e) { /* keep the seeded value */ }
+    }
+  }
 
   FileView {
     id: systemStatusFile

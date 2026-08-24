@@ -254,7 +254,7 @@ Panel {
           Item {
             id: upgradeRow
             width: parent.width
-            visible: sec.haveData && !sec.privileged
+            visible: sec.haveData && (!sec.privileged || sec.collectorOutdated)
             implicitHeight: upgradeText.implicitHeight + Style.space(12)
 
             Rectangle {
@@ -278,7 +278,9 @@ Panel {
 
               Text {
                 width: parent.width
-                text: sec.installing ? "Authorising…" : "Enable full checks"
+                text: sec.installing
+                  ? "Authorising…"
+                  : (sec.collectorOutdated ? "Update the system collector" : "Enable full checks")
                 color: root.textColor
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -290,8 +292,14 @@ Panel {
                 wrapMode: Text.WordWrap
                 text: sec.installError !== ""
                   ? sec.installError
-                  : "Names every listening process and completes the file-integrity "
-                    + "sweep. Asks for your password once, then runs on a timer."
+                  : (sec.collectorOutdated
+                     ? "The installed collector is "
+                       + (sec.systemCollectorVersion === ""
+                          ? "older than this plugin (v" + sec.pluginVersion + ")."
+                          : "v" + sec.systemCollectorVersion + " but this plugin is v"
+                            + sec.pluginVersion + ".")
+                     : "Names every listening process and completes the file-integrity "
+                       + "sweep. Asks for your password once, then runs on a timer.")
                 color: sec.installError !== "" ? root.urgentColor : root.dimColor
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption

@@ -9,6 +9,11 @@
 
 set -uo pipefail
 
+# Bumped together with the plugin manifest. The widget compares this
+# against its own version so it can tell you when a plugin update has
+# left a stale copy of this script installed under /usr/local/bin.
+COLLECTOR_VERSION="1.0.0"
+
 if [ "$(id -u)" -eq 0 ]; then
   PRIVILEGED=1
   DEFAULT_RUNTIME=/run/omarchy-security
@@ -381,8 +386,10 @@ jq -nc \
   --arg status "$WORST" --arg summary "$SUMMARY" --argjson checks "$CHECKS" \
   --arg generatedAt "$(date -Is)" --argjson generatedAtUnix "$NOW" \
   --argjson privileged "$( [ "$PRIVILEGED" = 1 ] && echo true || echo false )" \
+  --arg collectorVersion "$COLLECTOR_VERSION" \
   '{
      schemaVersion: 1,
+     collectorVersion: $collectorVersion,
      generatedAt: $generatedAt,
      generatedAtUnix: $generatedAtUnix,
      privileged: $privileged,
