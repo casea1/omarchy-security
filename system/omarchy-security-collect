@@ -45,7 +45,11 @@ add_check() {
 }
 
 # build_section <summary> [extra-json-object]
-# Rolls the accumulated checks up to a worst-status and emits the section.
+# Rolls the accumulated checks up to a worst-status and publishes the section
+# in SECTION_OUT. It deliberately does not echo: the collect_* functions set
+# shell globals that later stages depend on, and capturing them with $(...)
+# would run them in a subshell and discard that state.
+SECTION_OUT=""
 build_section() {
   local summary="$1" extra="${2:-{\}}"
   local checks worst=ok worst_rank=0 st r
@@ -55,9 +59,9 @@ build_section() {
     r=$(rank_of "$st")
     if [ "$r" -gt "$worst_rank" ]; then worst_rank=$r; worst=$st; fi
   done < <(printf '%s' "$checks" | jq -r '.[].status')
-  jq -nc --arg status "$worst" --arg summary "$summary" \
+  SECTION_OUT=$(jq -nc --arg status "$worst" --arg summary "$summary" \
     --argjson checks "$checks" --argjson extra "$extra" \
-    '{status:$status,summary:$summary,checks:$checks} + $extra'
+    '{status:$status,summary:$summary,checks:$checks} + $extra')
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -159,34 +163,36 @@ collect_firewall() {
   build_section "$summary"
 }
 
-# Does ufw permit inbound <port>/<proto>?  Echoes: allowed|blocked|unknown
-# and sets UFW_MATCH_FROM for the allowing rule's source.
+# Does ufw permit inbound <port>/<proto>?  Publishes UFW_VERDICT
+# (allowed|blocked|unknown) and UFW_MATCH_FROM for the allowing rule's
+# source. Globals rather than stdout, for the subshell reason above.
 UFW_MATCH_FROM=""
+UFW_VERDICT="unknown"
 ufw_verdict() {
   local port="$1" proto="$2" r lo hi rproto rfrom
   UFW_MATCH_FROM=""
-  [ "$UFW_READABLE" = 1 ] || { echo unknown; return; }
-  [ "$UFW_ACTIVE" = 1 ] || { echo allowed; return; }
+  [ "$UFW_READABLE" = 1 ] || { UFW_VERDICT=unknown; return; }
+  [ "$UFW_ACTIVE" = 1 ] || { UFW_VERDICT=allowed; return; }
 
   for r in ${UFW_RULES+"${UFW_RULES[@]}"}; do
     IFS=: read -r lo hi rproto rfrom <<<"$r"
     [ "$rproto" = "any" ] || [ "$rproto" = "$proto" ] || continue
     if [ "$port" -ge "$lo" ] && [ "$port" -le "$hi" ]; then
       UFW_MATCH_FROM="$rfrom"
-      echo allowed; return
+      UFW_VERDICT=allowed; return
     fi
   done
 
   if [ "$UFW_BLANKET" = 1 ]; then
     UFW_MATCH_FROM="$UFW_BLANKET_FROM"
-    echo allowed; return
+    UFW_VERDICT=allowed; return
   fi
-  if [ "$UFW_UNPARSED" = 1 ]; then echo unknown; return; fi
+  if [ "$UFW_UNPARSED" = 1 ]; then UFW_VERDICT=unknown; return; fi
 
   case "$UFW_DEFAULT_IN" in
-    deny|reject) echo blocked ;;
-    allow) echo allowed ;;
-    *) echo unknown ;;
+    deny|reject) UFW_VERDICT=blocked ;;
+    allow) UFW_VERDICT=allowed ;;
+    *) UFW_VERDICT=unknown ;;
   esac
 }
 
@@ -245,8 +251,8 @@ collect_exposure() {
     fi
 
     case "$scope" in
-      all|specific) verdict=$(ufw_verdict "$port" "$netid") ;;
-      *) verdict="n/a" ;;
+      all|specific) ufw_verdict "$port" "$netid"; verdict="$UFW_VERDICT" ;;
+      *) verdict="n/a"; UFW_MATCH_FROM="" ;;
     esac
 
     case "$verdict" in
@@ -269,10 +275,16 @@ collect_exposure() {
   total=$(jq -r 'length' <<<"$listeners")
 
   if [ "$exposed" -gt 0 ]; then
+    # A v4 and a v6 socket on the same port are one finding, not two, and an
+    # unnamed process still needs a readable slot in the sentence.
     detail=$(jq -r '[.[] | select(.verdict=="allowed") |
-      ((.process // "?") + " on " + .proto + "/" + (.port|tostring))] | join(", ")' <<<"$listeners")
+      ((if (.process // "") == "" then "unnamed process" else .process end)
+       + " on " + .proto + "/" + (.port|tostring))] | unique | join(", ")' <<<"$listeners")
     add_check "exp.reachable" "Reachable from the network" "fail" \
       "$exposed listener(s): $detail" "close the port or drop the ufw allow rule"
+  elif [ "$unknown_n" -gt 0 ]; then
+    add_check "exp.reachable" "Reachable from the network" "unknown" \
+      "no listener is known to be reachable, but $unknown_n could not be checked" ""
   else
     add_check "exp.reachable" "Reachable from the network" "ok" "nothing inbound is permitted"
   fi
@@ -395,9 +407,9 @@ collect_network() {
 
 # ---------------------------------------------------------------- assemble
 
-FIREWALL=$(collect_firewall)
-EXPOSURE=$(collect_exposure)
-NETWORK=$(collect_network)
+collect_firewall; FIREWALL="$SECTION_OUT"
+collect_exposure; EXPOSURE="$SECTION_OUT"
+collect_network;  NETWORK="$SECTION_OUT"
 
 TMP=$(mktemp "$OUT_DIR/.status.XXXXXX")
 jq -nc \
