@@ -1,0 +1,15 @@
+// Let the desktop user re-run the security collectors on demand without a
+// password prompt. Deliberately narrow: only "start", only these two
+// oneshot units, only members of wheel. Neither unit accepts arguments and
+// neither changes system state — they read and write a JSON snapshot.
+polkit.addRule(function (action, subject) {
+  if (action.id !== "org.freedesktop.systemd1.manage-units") return;
+  if (!subject.isInGroup("wheel")) return;
+  if (action.lookup("verb") !== "start") return;
+
+  var unit = action.lookup("unit");
+  if (unit === "omarchy-security-collect.service" ||
+      unit === "omarchy-security-audit.service") {
+    return polkit.Result.YES;
+  }
+});

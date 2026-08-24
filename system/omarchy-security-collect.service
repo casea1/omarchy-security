@@ -1,0 +1,24 @@
+[Unit]
+Description=Omarchy security collector (fast checks)
+Documentation=https://github.com/caseaustin12/omarchy-security
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/omarchy-security-collect
+
+# RuntimeDirectoryPreserve is load-bearing: without it systemd deletes
+# /run/omarchy-security the moment this oneshot exits, and the widget would
+# find nothing to read between ticks.
+RuntimeDirectory=omarchy-security
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=omarchy-security
+StateDirectoryMode=0755
+
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+Nice=10
+IOSchedulingClass=idle

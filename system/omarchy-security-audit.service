@@ -1,0 +1,22 @@
+[Unit]
+Description=Omarchy security collector (advisories and file integrity)
+Documentation=https://github.com/caseaustin12/omarchy-security
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/omarchy-security-audit
+TimeoutStartSec=20min
+
+RuntimeDirectory=omarchy-security
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=omarchy-security
+StateDirectoryMode=0755
+
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+Nice=19
+IOSchedulingClass=idle

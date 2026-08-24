@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.caseaustin12.security",
+  "name": "Security",
+  "version": "1.0.0",
+  "author": "Austin Case",
+  "license": "MIT",
+  "description": "Firewall state, network exposure, and package integrity in the Omarchy bar",
+  "homepage": "https://github.com/caseaustin12/omarchy-security",
+  "repository": "https://github.com/caseaustin12/omarchy-security",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Security",
+    "description": "Correlates listening sockets against ufw rules, watches network hygiene, and tracks package advisories and file integrity.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showBadge": true,
+      "staleAfterSec": 300,
+      "warnColor": "",
+      "showLocalListeners": false
+    },
+    "schema": [
+      {
+        "key": "showBadge",
+        "type": "bool",
+        "label": "Show a count of warnings next to the icon",
+        "defaultValue": true
+      },
+      {
+        "key": "staleAfterSec",
+        "type": "integer",
+        "label": "Treat the collector's data as stale after this many seconds",
+        "min": 60,
+        "max": 86400,
+        "step": 30,
+        "defaultValue": 300
+      },
+      {
+        "key": "warnColor",
+        "type": "string",
+        "label": "Colour for warnings (blank uses a theme-neutral amber)"
+      },
+      {
+        "key": "showLocalListeners",
+        "type": "bool",
+        "label": "List loopback-only listeners in the exposure table",
+        "defaultValue": false
+      }
+    ]
+  }
+}

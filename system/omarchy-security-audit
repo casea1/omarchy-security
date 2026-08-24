@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# Slow security collector for the Omarchy security widget.
+#
+# Split from omarchy-security-collect because everything here is expensive:
+# arch-audit makes a network call to security.archlinux.org, and a full
+# pacman -Qkk checksums every packaged file on the system. Neither belongs
+# on a 60-second loop. Runs hourly; the file-integrity sweep is additionally
+# throttled to once a day and its last result cached in between.
+
+set -uo pipefail
+
+OUT_DIR="${OMARCHY_SECURITY_RUNTIME:-/run/omarchy-security}"
+STATE_DIR="${OMARCHY_SECURITY_STATE:-/var/lib/omarchy-security}"
+OUT="$OUT_DIR/integrity.json"
+AUDIT_STATE="$STATE_DIR/audit-state.json"
+FILECHECK_INTERVAL=${OMARCHY_SECURITY_FILECHECK_INTERVAL:-86400}
+
+mkdir -p "$OUT_DIR" "$STATE_DIR" 2>/dev/null
+[ -f "$AUDIT_STATE" ] || echo '{}' > "$AUDIT_STATE"
+
+rank_of() {
+  case "$1" in
+    fail) echo 3 ;; warn) echo 2 ;; unknown) echo 1 ;; *) echo 0 ;;
+  esac
+}
+
+CHECKS_JSON=""
+add_check() {
+  local obj
+  obj=$(jq -nc --arg id "$1" --arg label "$2" --arg status "$3" \
+    --arg detail "$4" --arg remedy "${5:-}" \
+    '{id:$id,label:$label,status:$status,detail:$detail,remedy:$remedy}')
+  CHECKS_JSON="${CHECKS_JSON}${obj}"$'\n'
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+state_get() { jq -r --arg k "$1" '.[$k] // empty' "$AUDIT_STATE" 2>/dev/null; }
+state_set() {
+  jq -c --arg k "$1" --argjson v "$2" '.[$k]=$v' "$AUDIT_STATE" > "$AUDIT_STATE.tmp" 2>/dev/null \
+    && mv "$AUDIT_STATE.tmp" "$AUDIT_STATE"
+}
+
+NOW=$(date +%s)
+
+# ------------------------------------------------- known vulnerabilities
+
+CVE_TOTAL=0
+check_cve() {
+  if ! have arch-audit; then
+    add_check "int.cve" "Known vulnerabilities" "unknown" \
+      "arch-audit is not installed" "sudo pacman -S arch-audit"
+    return
+  fi
+
+  local raw parsed crit high med low
+  raw=$(arch-audit --json 2>/dev/null)
+
+  if [ -n "$raw" ] && parsed=$(jq -e 'type=="array"' <<<"$raw" >/dev/null 2>&1 && echo ok); then
+    crit=$(jq '[.[] | select((.severity // "") | ascii_downcase == "critical")] | length' <<<"$raw")
+    high=$(jq '[.[] | select((.severity // "") | ascii_downcase == "high")] | length' <<<"$raw")
+    med=$(jq  '[.[] | select((.severity // "") | ascii_downcase == "medium")] | length' <<<"$raw")
+    low=$(jq  '[.[] | select((.severity // "") | ascii_downcase | IN("low","unknown",""))] | length' <<<"$raw")
+    CVE_TOTAL=$(jq 'length' <<<"$raw")
+
+    local names
+    names=$(jq -r '[.[] | .name // .package // empty] | unique | .[0:6] | join(", ")' <<<"$raw")
+
+    if [ "${crit:-0}" -gt 0 ] || [ "${high:-0}" -gt 0 ]; then
+      add_check "int.cve" "Known vulnerabilities" "fail" \
+        "$CVE_TOTAL affected package(s) — ${crit} critical, ${high} high: ${names}" \
+        "omarchy update"
+    elif [ "$CVE_TOTAL" -gt 0 ]; then
+      add_check "int.cve" "Known vulnerabilities" "warn" \
+        "$CVE_TOTAL affected package(s) — ${med} medium, ${low} low: ${names}" \
+        "omarchy update"
+    else
+      add_check "int.cve" "Known vulnerabilities" "ok" "no packages with published advisories"
+    fi
+    state_set lastCveUnix "$NOW"
+    return
+  fi
+
+  # arch-audit ran but gave us nothing parseable — most often no network.
+  local text
+  text=$(arch-audit 2>/dev/null)
+  if [ -z "$text" ]; then
+    add_check "int.cve" "Known vulnerabilities" "unknown" \
+      "arch-audit returned nothing (advisory database unreachable?)" ""
+  elif grep -qi 'no vulnerable' <<<"$text"; then
+    add_check "int.cve" "Known vulnerabilities" "ok" "no packages with published advisories"
+  else
+    CVE_TOTAL=$(grep -ci 'is affected by' <<<"$text")
+    add_check "int.cve" "Known vulnerabilities" "warn" \
+      "$CVE_TOTAL affected package(s)" "omarchy update"
+  fi
+}
+
+# ------------------------------------------------- packaged file integrity
+
+check_files() {
+  local last cached age
+  last=$(state_get lastFileCheckUnix)
+  cached=$(state_get fileResult)
+  age=$(( NOW - ${last:-0} ))
+
+  if [ -n "$last" ] && [ -n "$cached" ] && [ "$age" -lt "$FILECHECK_INTERVAL" ]; then
+    report_files "$cached" "$age"
+    return
+  fi
+
+  local out result
+  out=$(pacman -Qkk 2>&1)
+  if [ -z "$out" ]; then
+    add_check "int.files" "Packaged file integrity" "unknown" "pacman -Qkk produced no output" ""
+    return
+  fi
+
+  # pacman emits one line per differing attribute, so the same file appears
+  # up to three times; classify per path, not per line, and let a content
+  # difference outrank a mere timestamp one on the same file.
+  #
+  # Only executable paths are treated as a finding. A rewritten plymouth
+  # asset under /usr/share is what a theming distro does to itself; a
+  # rewritten binary under /usr/lib is not.
+  result=$(awk '
+    /^backup file:/ { next }
+    !/^warning: /   { next }
+    {
+      line = $0
+      sub(/^warning: /, "", line)
+      pkg = line; sub(/:.*/, "", pkg)
+      path = line; sub(/^[^:]*: /, "", path); sub(/ \(.*/, "", path)
+      reason = line; sub(/^.*\(/, "", reason); sub(/\).*/, "", reason)
+
+      if (reason ~ /failed to calculate|Permission denied|No such file/) cls = "unreadable"
+      else if (reason ~ /SHA256|Size|File type/)                         cls = "content"
+      else                                                               cls = "drift"
+
+      r["unreadable"] = 1; r["drift"] = 2; r["content"] = 3
+      if (!(path in klass) || r[cls] > r[klass[path]]) { klass[path] = cls; owner[path] = pkg }
+    }
+    END {
+      for (path in klass) {
+        cls = klass[path]
+        if (cls == "unreadable") { unreadable++; continue }
+        if (cls == "drift")      { drift++; continue }
+        if (path == "/etc/resolv.conf") { drift++; continue }
+        if (path ~ /^\/etc\//)  { conf++; continue }
+        if (path ~ /^\/(usr\/)?(bin|sbin|lib|lib32|libexec)\//) { code++; codepkgs[owner[path]] = 1; continue }
+        data++
+      }
+      names = ""
+      for (p in codepkgs) names = names (names == "" ? "" : " ") p
+      printf "%d %d %d %d %d %s", code+0, data+0, conf+0, drift+0, unreadable+0, names
+    }' <<<"$out")
+
+  state_set lastFileCheckUnix "$NOW"
+  state_set fileResult "$(jq -Rn --arg s "$result" '$s')"
+  report_files "$result" 0
+}
+
+# report_files <"code data conf drift unreadable pkg..."> <age-seconds>
+report_files() {
+  local packed="$1" age="${2:-0}" code data conf drift unreadable pkgs suffix="" note=""
+  read -r code data conf drift unreadable pkgs <<<"$packed"
+  code=${code:-0}; data=${data:-0}; conf=${conf:-0}; drift=${drift:-0}; unreadable=${unreadable:-0}
+  [ "$age" -gt 3600 ] && suffix=" (checked $(( age / 3600 ))h ago)"
+
+  [ "$data" -gt 0 ]  && note="${note}, $data data file(s)"
+  [ "$conf" -gt 0 ]  && note="${note}, $conf config file(s)"
+  [ "$drift" -gt 0 ] && note="${note}, $drift ownership/mode difference(s)"
+  [ "$unreadable" -gt 0 ] && note="${note}, $unreadable unreadable"
+
+  if [ "$code" -gt 0 ]; then
+    add_check "int.files" "Packaged file integrity" "warn" \
+      "$code executable file(s) differ from their package: ${pkgs}${note}${suffix}" \
+      "pacman -Qkk ${pkgs%% *} to list them, then reinstall that package"
+  else
+    add_check "int.files" "Packaged file integrity" "ok" \
+      "no packaged executable differs${note}${suffix}"
+  fi
+}
+
+# ------------------------------------------------- boot and disk
+
+check_secureboot() {
+  if ! have bootctl; then
+    add_check "int.secureboot" "Secure Boot" "unknown" "bootctl not available" ""
+    return
+  fi
+  local line
+  line=$(bootctl status 2>/dev/null | grep -i 'Secure Boot:' | head -1 | sed 's/.*Secure Boot: *//')
+  case "$line" in
+    enabled*) add_check "int.secureboot" "Secure Boot" "ok" "enabled" ;;
+    "")       add_check "int.secureboot" "Secure Boot" "unknown" "not reported (BIOS boot?)" ;;
+    *)        add_check "int.secureboot" "Secure Boot" "warn" "$line" \
+                "enrol keys in firmware and sign the bootloader, or accept the risk" ;;
+  esac
+}
+
+check_luks() {
+  local src chain
+  src=$(findmnt -no SOURCE / 2>/dev/null | sed 's/\[.*\]//')
+  if [ -z "$src" ]; then
+    add_check "int.luks" "Root disk encryption" "unknown" "could not resolve the root device" ""
+    return
+  fi
+  chain=$(lsblk -ns -o TYPE "$src" 2>/dev/null)
+  if grep -q crypt <<<"$chain"; then
+    add_check "int.luks" "Root disk encryption" "ok" "root is on a LUKS volume"
+  else
+    add_check "int.luks" "Root disk encryption" "warn" "root is not encrypted" \
+      "encryption cannot be added in place; it is set at install time"
+  fi
+}
+
+check_reboot() {
+  local running moddir base
+  running=$(uname -r)
+  moddir="/usr/lib/modules/$running"
+  if [ -d "$moddir" ]; then
+    base=$(cat "$moddir/pkgbase" 2>/dev/null)
+    add_check "int.reboot" "Running kernel" "ok" "$running (${base:-linux}) is the installed kernel"
+  else
+    add_check "int.reboot" "Running kernel" "warn" \
+      "$running has been replaced on disk — a reboot is needed to run the patched kernel" \
+      "omarchy system reboot"
+  fi
+}
+
+check_foreign() {
+  local n
+  n=$(pacman -Qmq 2>/dev/null | wc -l)
+  add_check "int.foreign" "Packages outside the repos" "info" \
+    "$n AUR/foreign package(s) — these are not covered by Arch advisories" ""
+}
+
+# ------------------------------------------------- assemble
+
+check_cve
+check_files
+check_secureboot
+check_luks
+check_reboot
+check_foreign
+
+CHECKS=$(printf '%s' "$CHECKS_JSON" | jq -sc '.')
+WORST=ok; WORST_RANK=0
+while IFS= read -r st; do
+  [ -z "$st" ] && continue
+  r=$(rank_of "$st")
+  if [ "$r" -gt "$WORST_RANK" ]; then WORST_RANK=$r; WORST=$st; fi
+done < <(jq -r '.[].status' <<<"$CHECKS")
+
+SUMMARY="clean"
+[ "${CVE_TOTAL:-0}" -gt 0 ] && SUMMARY="$CVE_TOTAL package(s) with advisories"
+
+TMP=$(mktemp "$OUT_DIR/.integrity.XXXXXX")
+jq -nc \
+  --arg status "$WORST" --arg summary "$SUMMARY" --argjson checks "$CHECKS" \
+  --arg generatedAt "$(date -Is)" --argjson generatedAtUnix "$NOW" \
+  '{
+     schemaVersion: 1,
+     generatedAt: $generatedAt,
+     generatedAtUnix: $generatedAtUnix,
+     sections: { integrity: { status:$status, summary:$summary, checks:$checks } }
+   }' > "$TMP"
+
+chmod 0644 "$TMP"
+mv "$TMP" "$OUT"

@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# Fast security collector for the Omarchy security widget.
+#
+# Runs as root on a short timer and writes a JSON snapshot that the
+# unprivileged QML widget merely reads. Nothing in the UI ever needs a
+# polkit prompt because nothing in the UI ever needs privilege.
+#
+# Never exits non-zero for a missing tool or an unreadable source: a check
+# that could not run reports "unknown", which is deliberately not "ok".
+
+set -uo pipefail
+
+OUT_DIR="${OMARCHY_SECURITY_RUNTIME:-/run/omarchy-security}"
+STATE_DIR="${OMARCHY_SECURITY_STATE:-/var/lib/omarchy-security}"
+OUT="$OUT_DIR/status.json"
+GW_STATE="$STATE_DIR/gateways.json"
+
+mkdir -p "$OUT_DIR" "$STATE_DIR" 2>/dev/null
+
+# ---------------------------------------------------------------- helpers
+
+# Rank used to roll a section up to its worst child. "info" is deliberately
+# absent: informational rows carry detail, never severity, so an inventory
+# count can never turn the bar icon amber.
+rank_of() {
+  case "$1" in
+    fail) echo 3 ;;
+    warn) echo 2 ;;
+    unknown) echo 1 ;;
+    *) echo 0 ;;
+  esac
+}
+
+CHECKS_JSON=""
+reset_checks() { CHECKS_JSON=""; }
+
+# add_check <id> <label> <status> <detail> [remedy]
+add_check() {
+  local obj
+  obj=$(jq -nc \
+    --arg id "$1" --arg label "$2" --arg status "$3" \
+    --arg detail "$4" --arg remedy "${5:-}" \
+    '{id:$id,label:$label,status:$status,detail:$detail,remedy:$remedy}')
+  CHECKS_JSON="${CHECKS_JSON}${obj}"$'\n'
+}
+
+# build_section <summary> [extra-json-object]
+# Rolls the accumulated checks up to a worst-status and emits the section.
+build_section() {
+  local summary="$1" extra="${2:-{\}}"
+  local checks worst=ok worst_rank=0 st r
+  checks=$(printf '%s' "$CHECKS_JSON" | jq -sc '.')
+  while IFS= read -r st; do
+    [ -z "$st" ] && continue
+    r=$(rank_of "$st")
+    if [ "$r" -gt "$worst_rank" ]; then worst_rank=$r; worst=$st; fi
+  done < <(printf '%s' "$checks" | jq -r '.[].status')
+  jq -nc --arg status "$worst" --arg summary "$summary" \
+    --argjson checks "$checks" --argjson extra "$extra" \
+    '{status:$status,summary:$summary,checks:$checks} + $extra'
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- firewall
+
+UFW_ACTIVE=0
+UFW_READABLE=0
+UFW_DEFAULT_IN="unknown"
+UFW_BLANKET=0        # a rule allowing every port (To == Anywhere)
+UFW_BLANKET_FROM=""
+UFW_UNPARSED=0       # an app-profile rule we cannot map to ports
+declare -a UFW_RULES=()   # "startport:endport:proto:from"
+
+collect_firewall() {
+  reset_checks
+  local out rule_count=0
+
+  if ! have ufw; then
+    add_check "fw.active" "Firewall" "unknown" "ufw is not installed" "sudo pacman -S ufw"
+    build_section "ufw not installed"
+    return
+  fi
+
+  out=$(ufw status verbose 2>/dev/null)
+  if [ -z "$out" ]; then
+    add_check "fw.active" "Firewall" "unknown" "could not read ufw status" "run the collector as root"
+    build_section "ufw status unreadable"
+    return
+  fi
+  UFW_READABLE=1
+
+  if grep -qi '^Status: active' <<<"$out"; then
+    UFW_ACTIVE=1
+    add_check "fw.active" "Firewall" "ok" "ufw is active"
+  else
+    add_check "fw.active" "Firewall" "fail" "ufw is inactive" "sudo ufw enable"
+  fi
+
+  # "Default: deny (incoming), allow (outgoing), disabled (routed)"
+  local defline
+  defline=$(grep -i '^Default:' <<<"$out" | head -1)
+  if [ -n "$defline" ]; then
+    UFW_DEFAULT_IN=$(sed -n 's/.*Default: *\([a-z]*\) (incoming).*/\1/p' <<<"$defline")
+    case "$UFW_DEFAULT_IN" in
+      deny|reject)
+        add_check "fw.default-incoming" "Default incoming policy" "ok" "$UFW_DEFAULT_IN" ;;
+      allow)
+        add_check "fw.default-incoming" "Default incoming policy" "fail" "allow — every port is open unless a rule denies it" "sudo ufw default deny incoming" ;;
+      *)
+        add_check "fw.default-incoming" "Default incoming policy" "unknown" "could not parse" "" ;;
+    esac
+  else
+    add_check "fw.default-incoming" "Default incoming policy" "unknown" "not reported" ""
+  fi
+
+  # Parse ALLOW IN rules into port ranges so listeners can be correlated.
+  local line to from spec lo hi proto
+  while IFS= read -r line; do
+    [[ "$line" != *"ALLOW IN"* ]] && continue
+    rule_count=$((rule_count + 1))
+    to=$(sed 's/ALLOW IN.*//' <<<"$line" | sed 's/ *$//')
+    from=$(sed 's/.*ALLOW IN *//' <<<"$line" | sed 's/ *$//')
+    to=${to//(v6)/}
+    from=${from//(v6)/}
+    to=$(sed 's/ *$//' <<<"$to")
+    from=$(sed 's/ *$//;s/^ *//' <<<"$from")
+    spec=${to##* }
+
+    if [ "$spec" = "Anywhere" ] || [ -z "$spec" ]; then
+      UFW_BLANKET=1
+      UFW_BLANKET_FROM="$from"
+      continue
+    fi
+    if [[ "$spec" =~ ^([0-9]+)(:([0-9]+))?(/(tcp|udp))?$ ]]; then
+      lo="${BASH_REMATCH[1]}"
+      hi="${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}"
+      proto="${BASH_REMATCH[5]:-any}"
+      UFW_RULES+=("$lo:$hi:$proto:$from")
+    else
+      # An application profile ("Samba", "OpenSSH"). We refuse to guess its
+      # ports: an unresolved rule makes exposure "unknown", never "blocked".
+      UFW_UNPARSED=1
+    fi
+  done <<<"$out"
+
+  add_check "fw.rules" "Allow rules" "info" "$rule_count rule line(s)" ""
+  if [ "$UFW_UNPARSED" = 1 ]; then
+    add_check "fw.app-profiles" "Application profile rules" "info" \
+      "present — port correlation falls back to unknown for affected listeners" ""
+  fi
+
+  local summary
+  if [ "$UFW_ACTIVE" = 1 ]; then
+    summary="active, incoming $UFW_DEFAULT_IN"
+  else
+    summary="inactive"
+  fi
+  build_section "$summary"
+}
+
+# Does ufw permit inbound <port>/<proto>?  Echoes: allowed|blocked|unknown
+# and sets UFW_MATCH_FROM for the allowing rule's source.
+UFW_MATCH_FROM=""
+ufw_verdict() {
+  local port="$1" proto="$2" r lo hi rproto rfrom
+  UFW_MATCH_FROM=""
+  [ "$UFW_READABLE" = 1 ] || { echo unknown; return; }
+  [ "$UFW_ACTIVE" = 1 ] || { echo allowed; return; }
+
+  for r in ${UFW_RULES+"${UFW_RULES[@]}"}; do
+    IFS=: read -r lo hi rproto rfrom <<<"$r"
+    [ "$rproto" = "any" ] || [ "$rproto" = "$proto" ] || continue
+    if [ "$port" -ge "$lo" ] && [ "$port" -le "$hi" ]; then
+      UFW_MATCH_FROM="$rfrom"
+      echo allowed; return
+    fi
+  done
+
+  if [ "$UFW_BLANKET" = 1 ]; then
+    UFW_MATCH_FROM="$UFW_BLANKET_FROM"
+    echo allowed; return
+  fi
+  if [ "$UFW_UNPARSED" = 1 ]; then echo unknown; return; fi
+
+  case "$UFW_DEFAULT_IN" in
+    deny|reject) echo blocked ;;
+    allow) echo allowed ;;
+    *) echo unknown ;;
+  esac
+}
+
+# ---------------------------------------------------------------- exposure
+
+# Addresses belonging to container / virtual bridges, so a docker DNS
+# listener is not reported as a machine-wide exposure.
+bridge_addrs() {
+  ip -j addr show 2>/dev/null | jq -r '
+    .[] | select(.ifname | test("^(docker|br-|virbr|veth|podman|cni)")) |
+    .addr_info[]? | .local' 2>/dev/null
+}
+
+# Every address currently configured on the box. A socket bound to an address
+# that no longer exists (a docker bridge that went away with the daemon) is
+# not reachable by anyone, and must not be correlated as though it were.
+local_addrs() {
+  ip -j addr show 2>/dev/null | jq -r '.[].addr_info[]? | .local' 2>/dev/null
+}
+
+collect_exposure() {
+  reset_checks
+  local bridges laddrs listeners_json="" exposed=0 open_blocked=0 unknown_n=0 orphan_n=0
+
+  bridges=$(bridge_addrs | tr '\n' ' ')
+  laddrs=$(local_addrs | tr '\n' ' ')
+
+  local line netid local_field proc addr port scope verdict pname ppid detail
+  while IFS=$'\t' read -r netid local_field proc; do
+    [ -z "${local_field:-}" ] && continue
+    port="${local_field##*:}"
+    addr="${local_field%:*}"
+    addr="${addr#[}"; addr="${addr%]}"; addr="${addr%%\%*}"
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+
+    pname=$(sed -n 's/.*users:((\"\([^"]*\)\".*/\1/p' <<<"${proc:-}")
+    ppid=$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<<"${proc:-}")
+
+    case "$addr" in
+      127.*|::1) scope="local" ;;
+      0.0.0.0|::|"*") scope="all" ;;
+      100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*|fd7a:115c:a1e0*) scope="tailnet" ;;
+      22[4-9].*|23[0-9].*|ff0*) scope="multicast" ;;
+      fe80*) scope="linklocal" ;;
+      *) scope="specific" ;;
+    esac
+
+    if [ "$scope" = "specific" ]; then
+      if [[ " $bridges " == *" $addr "* ]]; then
+        scope="container"
+      elif [[ " $laddrs " != *" $addr "* ]]; then
+        # Bound to an address this machine no longer has.
+        scope="orphan"
+        orphan_n=$((orphan_n + 1))
+      fi
+    fi
+
+    case "$scope" in
+      all|specific) verdict=$(ufw_verdict "$port" "$netid") ;;
+      *) verdict="n/a" ;;
+    esac
+
+    case "$verdict" in
+      allowed) exposed=$((exposed + 1)) ;;
+      blocked) open_blocked=$((open_blocked + 1)) ;;
+      unknown) unknown_n=$((unknown_n + 1)) ;;
+    esac
+
+    listeners_json="${listeners_json}$(jq -nc \
+      --arg proto "$netid" --arg addr "$addr" --argjson port "$port" \
+      --arg scope "$scope" --arg verdict "$verdict" \
+      --arg process "${pname:-}" --arg pid "${ppid:-}" \
+      --arg from "${UFW_MATCH_FROM:-}" \
+      '{proto:$proto,address:$addr,port:$port,scope:$scope,verdict:$verdict,process:$process,pid:$pid,allowedFrom:$from}')"$'\n'
+  done < <(ss -tulnpH 2>/dev/null | awk '{p=""; for(i=7;i<=NF;i++) p=p $i; print $1"\t"$5"\t"p}')
+
+  local listeners
+  listeners=$(printf '%s' "$listeners_json" | jq -sc 'unique_by([.proto,.address,.port,.process])')
+  local total
+  total=$(jq -r 'length' <<<"$listeners")
+
+  if [ "$exposed" -gt 0 ]; then
+    detail=$(jq -r '[.[] | select(.verdict=="allowed") |
+      ((.process // "?") + " on " + .proto + "/" + (.port|tostring))] | join(", ")' <<<"$listeners")
+    add_check "exp.reachable" "Reachable from the network" "fail" \
+      "$exposed listener(s): $detail" "close the port or drop the ufw allow rule"
+  else
+    add_check "exp.reachable" "Reachable from the network" "ok" "nothing inbound is permitted"
+  fi
+
+  if [ "$open_blocked" -gt 0 ]; then
+    add_check "exp.firewalled" "Bound to all interfaces but firewalled" "info" \
+      "$open_blocked listener(s) — the firewall is what is stopping them" ""
+  fi
+  if [ "$unknown_n" -gt 0 ]; then
+    add_check "exp.uncorrelated" "Listeners with an unresolved rule" "unknown" \
+      "$unknown_n listener(s) could not be matched against ufw rules" ""
+  fi
+  if [ "$orphan_n" -gt 0 ]; then
+    add_check "exp.orphan" "Bound to a vanished interface" "info" \
+      "$orphan_n listener(s) — the address is gone, so nothing can reach them" ""
+  fi
+  add_check "exp.total" "Listening sockets" "info" "$total total" ""
+
+  # sshd is the exposure everyone forgets about, so it gets its own row.
+  local ssh_state
+  ssh_state=$(systemctl is-enabled sshd 2>/dev/null)
+  if [ "$ssh_state" = "enabled" ]; then
+    if systemctl is-active --quiet sshd 2>/dev/null; then
+      add_check "exp.sshd" "SSH server" "warn" "sshd is enabled and running" \
+        "omarchy remove security sshd (if you do not need it)"
+    else
+      add_check "exp.sshd" "SSH server" "warn" "sshd is enabled but not running" ""
+    fi
+  else
+    add_check "exp.sshd" "SSH server" "ok" "disabled"
+  fi
+
+  local summary
+  if [ "$exposed" -gt 0 ]; then summary="$exposed reachable"
+  elif [ "$unknown_n" -gt 0 ]; then summary="$unknown_n unresolved"
+  else summary="nothing reachable"; fi
+  build_section "$summary" "$(jq -nc --argjson l "$listeners" '{listeners:$l}')"
+}
+
+# ---------------------------------------------------------------- network
+
+collect_network() {
+  reset_checks
+  local route gw dev contype ssid security dns dot
+
+  route=$(ip -j route show default 2>/dev/null | jq -c '.[0] // {}')
+  gw=$(jq -r '.gateway // ""' <<<"$route")
+  dev=$(jq -r '.dev // ""' <<<"$route")
+
+  if [ -z "$dev" ]; then
+    add_check "net.route" "Default route" "warn" "no default route — this machine is offline" ""
+  else
+    contype=$(nmcli -t -f DEVICE,TYPE con show --active 2>/dev/null | awk -F: -v d="$dev" '$1==d{print $2}' | head -1)
+    add_check "net.route" "Default route" "info" "${dev} via ${gw:-unknown} (${contype:-unknown})" ""
+  fi
+
+  # Wi-Fi encryption. An open network is the single highest-value warning
+  # this widget can produce, so it is a fail rather than a warn.
+  if [ "${contype:-}" = "802-11-wireless" ] || [ "${contype:-}" = "wifi" ]; then
+    local wifi
+    wifi=$(nmcli -t -f ACTIVE,SSID,SECURITY dev wifi 2>/dev/null | grep '^yes:' | head -1)
+    ssid=$(cut -d: -f2 <<<"$wifi")
+    security=$(cut -d: -f3- <<<"$wifi")
+    if [ -z "$security" ] || [ "$security" = "--" ]; then
+      add_check "net.wifi" "Wi-Fi encryption" "fail" "\"$ssid\" is an open network — traffic is unencrypted" \
+        "use a VPN or tailscale on this network"
+    elif [[ "$security" == *WEP* ]]; then
+      add_check "net.wifi" "Wi-Fi encryption" "fail" "\"$ssid\" uses WEP, which is broken" ""
+    else
+      add_check "net.wifi" "Wi-Fi encryption" "ok" "\"$ssid\" — $security"
+    fi
+  else
+    add_check "net.wifi" "Wi-Fi encryption" "info" "not on Wi-Fi" ""
+  fi
+
+  # DNS resolvers and transport.
+  if have resolvectl; then
+    local status
+    status=$(resolvectl status 2>/dev/null)
+    dns=$(grep -m1 'Current DNS Server:' <<<"$status" | sed 's/.*Current DNS Server: *//')
+    if grep -q '+DNSOverTLS' <<<"$status"; then dot="on"; else dot="off"; fi
+    add_check "net.dns" "DNS resolver" "info" "${dns:-unknown}" ""
+    if [ "$dot" = "on" ]; then
+      add_check "net.dot" "DNS over TLS" "ok" "on"
+    else
+      add_check "net.dot" "DNS over TLS" "info" "off — DNS queries are sent in the clear" \
+        "set DNSOverTLS=yes in /etc/systemd/resolved.conf"
+    fi
+  else
+    add_check "net.dns" "DNS resolver" "unknown" "systemd-resolved not available" ""
+  fi
+
+  # Gateway MAC. A changed MAC for a gateway we have seen before on the same
+  # connection is the cheap local signal for ARP spoofing or a swapped router.
+  if [ -n "$gw" ] && [ -n "$dev" ]; then
+    local mac key prev
+    mac=$(ip neigh show "$gw" dev "$dev" 2>/dev/null | sed -n 's/.*lladdr \([0-9a-f:]*\).*/\1/p' | head -1)
+    key="${dev}|${gw}"
+    if [ -z "$mac" ]; then
+      add_check "net.gateway" "Gateway identity" "unknown" "no ARP entry for $gw yet" ""
+    else
+      [ -f "$GW_STATE" ] || echo '{}' > "$GW_STATE"
+      prev=$(jq -r --arg k "$key" '.[$k] // ""' "$GW_STATE" 2>/dev/null)
+      if [ -z "$prev" ]; then
+        add_check "net.gateway" "Gateway identity" "ok" "$mac (first seen, now remembered)"
+        jq -c --arg k "$key" --arg v "$mac" '.[$k]=$v' "$GW_STATE" > "$GW_STATE.tmp" 2>/dev/null \
+          && mv "$GW_STATE.tmp" "$GW_STATE"
+      elif [ "$prev" != "$mac" ]; then
+        add_check "net.gateway" "Gateway identity" "fail" \
+          "gateway MAC changed: $prev -> $mac" \
+          "expected after a router swap; otherwise treat this network as hostile"
+      else
+        add_check "net.gateway" "Gateway identity" "ok" "$mac (unchanged)"
+      fi
+    fi
+  fi
+
+  build_section "${dev:-offline}"
+}
+
+# ---------------------------------------------------------------- assemble
+
+FIREWALL=$(collect_firewall)
+EXPOSURE=$(collect_exposure)
+NETWORK=$(collect_network)
+
+TMP=$(mktemp "$OUT_DIR/.status.XXXXXX")
+jq -nc \
+  --argjson firewall "$FIREWALL" \
+  --argjson exposure "$EXPOSURE" \
+  --argjson network "$NETWORK" \
+  --arg generatedAt "$(date -Is)" \
+  --argjson generatedAtUnix "$(date +%s)" \
+  '{
+     schemaVersion: 1,
+     generatedAt: $generatedAt,
+     generatedAtUnix: $generatedAtUnix,
+     sections: { firewall: $firewall, exposure: $exposure, network: $network }
+   }' > "$TMP"
+
+chmod 0644 "$TMP"
+mv "$TMP" "$OUT"

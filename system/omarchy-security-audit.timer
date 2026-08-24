@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Omarchy security advisories and file integrity
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1h
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target
