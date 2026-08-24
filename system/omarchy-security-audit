@@ -9,8 +9,18 @@
 
 set -uo pipefail
 
-OUT_DIR="${OMARCHY_SECURITY_RUNTIME:-/run/omarchy-security}"
-STATE_DIR="${OMARCHY_SECURITY_STATE:-/var/lib/omarchy-security}"
+if [ "$(id -u)" -eq 0 ]; then
+  PRIVILEGED=1
+  DEFAULT_RUNTIME=/run/omarchy-security
+  DEFAULT_STATE=/var/lib/omarchy-security
+else
+  PRIVILEGED=0
+  DEFAULT_RUNTIME="${XDG_RUNTIME_DIR:-/tmp}/omarchy-security"
+  DEFAULT_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-security"
+fi
+
+OUT_DIR="${OMARCHY_SECURITY_RUNTIME:-$DEFAULT_RUNTIME}"
+STATE_DIR="${OMARCHY_SECURITY_STATE:-$DEFAULT_STATE}"
 OUT="$OUT_DIR/integrity.json"
 AUDIT_STATE="$STATE_DIR/audit-state.json"
 FILECHECK_INTERVAL=${OMARCHY_SECURITY_FILECHECK_INTERVAL:-86400}
@@ -46,53 +56,163 @@ NOW=$(date +%s)
 # ------------------------------------------------- known vulnerabilities
 
 CVE_TOTAL=0
+ADVISORY_URL=${OMARCHY_SECURITY_ADVISORY_URL:-https://security.archlinux.org/issues/all.json}
+ADVISORY_CACHE="$STATE_DIR/advisories.json"
+ADVISORY_TTL=${OMARCHY_SECURITY_ADVISORY_TTL:-21600}   # 6h
+
 check_cve() {
-  if ! have arch-audit; then
-    add_check "int.cve" "Known vulnerabilities" "unknown" \
-      "arch-audit is not installed" "sudo pacman -S arch-audit"
-    return
+  if have arch-audit; then
+    check_cve_arch_audit && return
   fi
+  # arch-audit is the reference implementation, but it is a package, and the
+  # widget is meant to be useful with nothing installed. The same advisory
+  # data is a public JSON document, and pacman ships the version comparator
+  # needed to use it, so fall back to doing the join ourselves.
+  check_cve_builtin
+}
 
-  local raw parsed crit high med low
+check_cve_arch_audit() {
+  local raw crit high med low names fixable
   raw=$(arch-audit --json 2>/dev/null)
+  jq -e 'type=="array"' <<<"${raw:-}" >/dev/null 2>&1 || return 1
 
-  if [ -n "$raw" ] && parsed=$(jq -e 'type=="array"' <<<"$raw" >/dev/null 2>&1 && echo ok); then
-    crit=$(jq '[.[] | select((.severity // "") | ascii_downcase == "critical")] | length' <<<"$raw")
-    high=$(jq '[.[] | select((.severity // "") | ascii_downcase == "high")] | length' <<<"$raw")
-    med=$(jq  '[.[] | select((.severity // "") | ascii_downcase == "medium")] | length' <<<"$raw")
-    low=$(jq  '[.[] | select((.severity // "") | ascii_downcase | IN("low","unknown",""))] | length' <<<"$raw")
-    CVE_TOTAL=$(jq 'length' <<<"$raw")
+  # arch-audit emits one entry per advisory group, and several can name the
+  # same package. Count and name packages, matching the fallback path, so the
+  # two implementations report the same number for the same machine.
+  CVE_TOTAL=$(jq '[.[] | .packages[]?] | unique | length' <<<"$raw")
+  names=$(jq -r '[.[] | .packages[]?] | unique | join(" ")' <<<"$raw")
+  fixable=$(jq '[.[] | select(.fixed != null) | .packages[]?] | unique | length' <<<"$raw")
 
-    local names
-    names=$(jq -r '[.[] | .name // .package // empty] | unique | .[0:6] | join(", ")' <<<"$raw")
+  crit=$(jq '[.[] | select((.severity // "") | ascii_downcase == "critical") | .packages[]?] | unique | length' <<<"$raw")
+  high=$(jq '[.[] | select((.severity // "") | ascii_downcase == "high") | .packages[]?] | unique | length' <<<"$raw")
+  med=$(jq  '[.[] | select((.severity // "") | ascii_downcase == "medium") | .packages[]?] | unique | length' <<<"$raw")
+  low=$(jq  '[.[] | select((.severity // "") | ascii_downcase | IN("low","unknown","")) | .packages[]?] | unique | length' <<<"$raw")
 
-    if [ "${crit:-0}" -gt 0 ] || [ "${high:-0}" -gt 0 ]; then
-      add_check "int.cve" "Known vulnerabilities" "fail" \
-        "$CVE_TOTAL affected package(s) — ${crit} critical, ${high} high: ${names}" \
-        "omarchy update"
-    elif [ "$CVE_TOTAL" -gt 0 ]; then
-      add_check "int.cve" "Known vulnerabilities" "warn" \
-        "$CVE_TOTAL affected package(s) — ${med} medium, ${low} low: ${names}" \
-        "omarchy update"
-    else
-      add_check "int.cve" "Known vulnerabilities" "ok" "no packages with published advisories"
-    fi
-    state_set lastCveUnix "$NOW"
+  emit_cve "$CVE_TOTAL" "${fixable:-0}" "${crit:-0}" "${high:-0}" "${med:-0}" "${low:-0}" \
+    "$(tr ' ' ',' <<<"$names" | sed 's/,/, /g')" "arch-audit"
+  return 0
+}
+
+# Refreshes the cached advisory document, tolerating being offline.
+fetch_advisories() {
+  local age=999999
+  if [ -f "$ADVISORY_CACHE" ]; then
+    age=$(( NOW - $(stat -c %Y "$ADVISORY_CACHE" 2>/dev/null || echo 0) ))
+    [ "$age" -lt "$ADVISORY_TTL" ] && return 0
+  fi
+  have curl || return 1
+
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/.adv.XXXXXX") || return 1
+  if curl -fsS --max-time 25 -o "$tmp" "$ADVISORY_URL" 2>/dev/null \
+     && jq -e 'type=="array" and length > 0' "$tmp" >/dev/null 2>&1; then
+    mv "$tmp" "$ADVISORY_CACHE"
+    return 0
+  fi
+  rm -f "$tmp"
+  # A stale cache still beats no answer; the caller reports its age.
+  [ -f "$ADVISORY_CACHE" ] && return 0
+  return 1
+}
+
+check_cve_builtin() {
+  if ! fetch_advisories; then
+    add_check "int.cve" "Known vulnerabilities" "unknown" \
+      "the advisory database is unreachable and nothing is cached" \
+      "check connectivity, or install arch-audit"
     return
   fi
 
-  # arch-audit ran but gave us nothing parseable — most often no network.
-  local text
-  text=$(arch-audit 2>/dev/null)
-  if [ -z "$text" ]; then
-    add_check "int.cve" "Known vulnerabilities" "unknown" \
-      "arch-audit returned nothing (advisory database unreachable?)" ""
-  elif grep -qi 'no vulnerable' <<<"$text"; then
-    add_check "int.cve" "Known vulnerabilities" "ok" "no packages with published advisories"
+  local cache_age installed candidates
+  cache_age=$(( NOW - $(stat -c %Y "$ADVISORY_CACHE" 2>/dev/null || echo "$NOW") ))
+
+  installed=$(mktemp "$STATE_DIR/.inst.XXXXXX")
+  pacman -Q 2>/dev/null | jq -Rn '[inputs | split(" ") | {key:.[0], value:.[1]}] | from_entries' > "$installed"
+
+  # One jq pass to the shortlist of advisories naming a package we have.
+  # Both statuses matter: "Vulnerable" means no fix exists yet, "Fixed" means
+  # one does and we may simply not have installed it.
+  #
+  # Fields are joined with a pipe rather than emitted as TSV because tab is
+  # IFS whitespace, so `read` silently collapses an empty field and shifts
+  # every column after it.
+  candidates=$(jq -r --slurpfile inst "$installed" '
+    [ .[]
+      | select(.status == "Vulnerable" or .status == "Fixed")
+      | . as $a | .packages[]
+      | select($inst[0][.] != null)
+      | [., $inst[0][.], $a.status, ($a.fixed // ""),
+         ($a.severity // "Unknown"), $a.name] | join("|")
+    ] | unique | .[]' "$ADVISORY_CACHE" 2>/dev/null)
+  rm -f "$installed"
+
+  local pkg ins status fixed severity avg
+  local total=0 fixable=0 crit=0 high=0 med=0 low=0 names=""
+
+  while IFS='|' read -r pkg ins status fixed severity avg; do
+    [ -z "${pkg:-}" ] && continue
+
+    # "Vulnerable" carries no fixed version because there is no fix — so
+    # having the package at all is the finding, whatever version it is.
+    # Deliberately NOT compared against the advisory's `affected` field:
+    # that records the version the advisory was filed against, not a ceiling
+    # below which you are safe.
+    if [ "$status" = "Fixed" ]; then
+      [ -n "$fixed" ] || continue
+      [ "$(vercmp "$ins" "$fixed")" -lt 0 ] || continue
+    fi
+
+    # Count affected packages, not advisory rows: three CVEs against one
+    # package is one thing to go and fix.
+    case " $names " in *" $pkg "*) continue ;; esac
+
+    [ "$status" = "Fixed" ] && fixable=$((fixable + 1))
+    total=$((total + 1))
+    case "$(tr '[:upper:]' '[:lower:]' <<<"$severity")" in
+      critical) crit=$((crit + 1)) ;;
+      high) high=$((high + 1)) ;;
+      medium) med=$((med + 1)) ;;
+      *) low=$((low + 1)) ;;
+    esac
+    case " $names " in *" $pkg "*) ;; *) names="${names:+$names }$pkg" ;; esac
+  done <<<"$candidates"
+
+  CVE_TOTAL=$total
+  local source="security.archlinux.org"
+  [ "$cache_age" -gt "$ADVISORY_TTL" ] && \
+    source="security.archlinux.org, cached $(( cache_age / 3600 ))h ago"
+
+  emit_cve "$total" "$fixable" "$crit" "$high" "$med" "$low" \
+    "$(tr ' ' ',' <<<"$names" | sed 's/,/, /g')" "$source"
+}
+
+emit_cve() {
+  local total="$1" fixable="$2" crit="$3" high="$4" med="$5" low="$6" names="$7" source="$8"
+  local shown extra sev
+
+  # Keep the sentence readable when fifteen packages are affected.
+  shown=$(cut -d, -f1-6 <<<"$names")
+  extra=$(( total - $(tr ',' '\n' <<<"$shown" | grep -c .) ))
+  [ "$extra" -gt 0 ] && shown="$shown +$extra more"
+
+  sev="$med medium, $low low"
+  [ "$crit" -gt 0 ] || [ "$high" -gt 0 ] && sev="$crit critical, $high high"
+
+  if [ "$total" -eq 0 ]; then
+    add_check "int.cve" "Known vulnerabilities" "ok" \
+      "no installed package has an open advisory ($source)"
+  elif [ "$fixable" -gt 0 ]; then
+    # A fix exists and is not installed. That is the actionable case, and the
+    # only one worth turning the bar icon red for.
+    add_check "int.cve" "Known vulnerabilities" "fail" \
+      "$fixable of $total affected package(s) already have a fix you have not installed — $sev: $shown" \
+      "omarchy update"
   else
-    CVE_TOTAL=$(grep -ci 'is affected by' <<<"$text")
+    # Upstream has published no fix yet, so there is nothing to install. Worth
+    # knowing, not worth an alarm you cannot act on.
     add_check "int.cve" "Known vulnerabilities" "warn" \
-      "$CVE_TOTAL affected package(s)" "omarchy update"
+      "$total affected package(s), no fix released yet — $sev: $shown" \
+      "nothing to do until Arch ships a fix; these clear themselves on update"
   fi
 }
 
@@ -260,10 +380,12 @@ TMP=$(mktemp "$OUT_DIR/.integrity.XXXXXX")
 jq -nc \
   --arg status "$WORST" --arg summary "$SUMMARY" --argjson checks "$CHECKS" \
   --arg generatedAt "$(date -Is)" --argjson generatedAtUnix "$NOW" \
+  --argjson privileged "$( [ "$PRIVILEGED" = 1 ] && echo true || echo false )" \
   '{
      schemaVersion: 1,
      generatedAt: $generatedAt,
      generatedAtUnix: $generatedAtUnix,
+     privileged: $privileged,
      sections: { integrity: { status:$status, summary:$summary, checks:$checks } }
    }' > "$TMP"
 

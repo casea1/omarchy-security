@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "Security",
-    "description": "Correlates listening sockets against ufw rules, watches network hygiene, and tracks package advisories and file integrity.",
+    "description": "Correlates listening sockets against ufw rules, watches network hygiene, and tracks package advisories and file integrity. Works with nothing installed.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",

@@ -34,50 +34,79 @@ one).
 
 ## Architecture
 
-The widget is unprivileged QML and never runs a privileged command. Opening
-the panel cannot produce an authentication prompt, because there is nothing
-to authenticate — the panel only reads a file.
+**The widget needs nothing installed.** It is unprivileged QML that runs the
+two collector scripts itself, as you, on a timer. Opening the panel cannot
+produce an authentication prompt, because there is nothing to authenticate.
+
+That works because almost nothing here actually needs privilege:
+
+- `ufw status` refuses to run as anyone but root, but every file it reads is
+  world-readable, and the `### tuple ###` lines in `/etc/ufw/user.rules` are a
+  *better* source than its output — application profiles arrive already
+  expanded into concrete ports, which the human-facing table leaves ambiguous.
+- The advisory database is a public JSON document, and `vercmp` ships with
+  pacman, so the CVE check is a join anyone can compute.
+- Listening sockets, routes, DNS, Wi-Fi, Secure Boot, LUKS and kernel state
+  are all readable by an ordinary user.
 
 ```
-root, on a systemd timer                     unprivileged, in omarchy-shell
-──────────────────────────                   ──────────────────────────────
-omarchy-security-collect  ──►  /run/omarchy-security/status.json     ──►  Panel.qml
-  every 60s                                                               (reads only)
-omarchy-security-audit    ──►  /run/omarchy-security/integrity.json  ──►
-  hourly; file sweep once a day
+default                                     optional (system/install.sh)
+───────────────────────────────────         ──────────────────────────────────
+Panel.qml runs the collectors as you        systemd timers run them as root
+  ↓                                           ↓
+$XDG_RUNTIME_DIR/omarchy-security/          /run/omarchy-security/
+  ↓                                           ↓
+        Service.qml reads whichever snapshot is newer
 ```
 
-The split exists because the two halves cost wildly different amounts.
-`arch-audit` makes a network call and `pacman -Qkk` checksums every packaged
-file on the system; neither belongs on a 60-second loop. Separate output
-files mean the two collectors never race on a read-modify-write, and the
-panel can honestly report each one's age.
+### What root actually buys
+
+Two things, both marked in the panel rather than silently missing:
+
+1. **Process attribution.** `ss` will not name a socket owned by another
+   user, so system daemons show as `—` until the collector runs as root.
+2. **A complete file-integrity sweep.** An ordinary user cannot read every
+   packaged file; those are counted as *unreadable*, never as *unchanged*.
+
+The optional installer also pulls in `arch-audit`. The built-in fallback was
+cross-checked against it and reports the identical package set, so this is a
+convenience rather than a requirement.
+
+### Design rules
 
 A check that could not run reports `unknown`, which is deliberately not
 `ok` — a security widget that shows green because it failed to look is worse
-than no widget at all. Stale data also degrades the shield to `unknown`
-rather than leaving the last known-good state on screen.
+than no widget. Stale data degrades the shield to `unknown` rather than
+leaving the last known-good state on screen.
+
+Severity tracks what you can *act on*. An advisory with a published fix you
+have not installed is a failure. An advisory upstream has not fixed yet is a
+warning, because turning the icon red for something nobody can install helps
+no one.
+
+The two collectors are split because they cost wildly different amounts:
+`arch-audit` makes a network call and `pacman -Qkk` checksums every packaged
+file, so neither belongs on a 60-second loop. Separate output files mean they
+never race on a read-modify-write, and the panel reports each one's age.
 
 ## Install
 
-The plugin directory is the whole widget; the privileged collector needs
-installing:
-
-```bash
-sudo ~/.config/omarchy/plugins/io.github.caseaustin12.security/system/install.sh
-```
-
-That installs two scripts to `/usr/local/bin`, four systemd units, a narrow
-polkit rule (wheel members may `start` those two units, nothing else), and
-`arch-audit` if it is missing.
-
-Then add it to the bar in `~/.config/omarchy/shell.json`:
+Nothing to do. Add it to the bar in `~/.config/omarchy/shell.json`:
 
 ```json
 { "id": "io.github.caseaustin12.security" }
 ```
 
-To remove the privileged half: `sudo .../system/uninstall.sh`.
+For the optional extras, click **Enable full checks** in the panel (it asks
+for your password once via pkexec), or run it yourself:
+
+```bash
+sudo ~/.config/omarchy/plugins/io.github.caseaustin12.security/system/install.sh
+```
+
+It is safe to re-run, and re-running is how you pick up updates to the
+collector scripts. To remove just the privileged half:
+`sudo .../system/uninstall.sh`.
 
 ## Interactions
 

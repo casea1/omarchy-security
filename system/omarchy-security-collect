@@ -10,8 +10,21 @@
 
 set -uo pipefail
 
-OUT_DIR="${OMARCHY_SECURITY_RUNTIME:-/run/omarchy-security}"
-STATE_DIR="${OMARCHY_SECURITY_STATE:-/var/lib/omarchy-security}"
+# Root writes where every session can read it; an ordinary user writes into
+# their own runtime dir. The widget runs this itself when the system timer
+# is not installed, so both paths are normal operation rather than fallback.
+if [ "$(id -u)" -eq 0 ]; then
+  PRIVILEGED=1
+  DEFAULT_RUNTIME=/run/omarchy-security
+  DEFAULT_STATE=/var/lib/omarchy-security
+else
+  PRIVILEGED=0
+  DEFAULT_RUNTIME="${XDG_RUNTIME_DIR:-/tmp}/omarchy-security"
+  DEFAULT_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-security"
+fi
+
+OUT_DIR="${OMARCHY_SECURITY_RUNTIME:-$DEFAULT_RUNTIME}"
+STATE_DIR="${OMARCHY_SECURITY_STATE:-$DEFAULT_STATE}"
 OUT="$OUT_DIR/status.json"
 GW_STATE="$STATE_DIR/gateways.json"
 
@@ -68,130 +81,174 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------- firewall
 
-UFW_ACTIVE=0
+UFW_ENABLED=0
+UFW_RUNNING=0
 UFW_READABLE=0
-UFW_DEFAULT_IN="unknown"
-UFW_BLANKET=0        # a rule allowing every port (To == Anywhere)
-UFW_BLANKET_FROM=""
-UFW_UNPARSED=0       # an app-profile rule we cannot map to ports
-declare -a UFW_RULES=()   # "startport:endport:proto:from"
+UFW_DEFAULT_IN=""
+UFW_RULE_COUNT=0
+# Each entry: action|proto|loport|hiport|src|dst, in file order. ufw applies
+# the first matching rule, so order is meaningful and must be preserved.
+declare -a UFW_RULES=()
+
+UFW_CONF=${OMARCHY_SECURITY_UFW_CONF:-/etc/ufw/ufw.conf}
+UFW_DEFAULTS=${OMARCHY_SECURITY_UFW_DEFAULTS:-/etc/default/ufw}
+UFW_RULES_V4=${OMARCHY_SECURITY_UFW_RULES:-/etc/ufw/user.rules}
+UFW_RULES_V6=${OMARCHY_SECURITY_UFW_RULES6:-/etc/ufw/user6.rules}
+
+# `ufw status` refuses to run as anyone but root, but every file it would
+# read is world-readable, and the "### tuple ###" lines are a structured form
+# of exactly the same ruleset — with application profiles already expanded
+# into concrete ports, which the human-facing table leaves ambiguous.
+parse_ufw_rules_file() {
+  local file="$1" line rest action proto dport dst sport src dir
+  local lo hi part
+  [ -r "$file" ] || return 1
+
+  while IFS= read -r line; do
+    case "$line" in "### tuple ### "*) ;; *) continue ;; esac
+    rest=${line#"### tuple ### "}
+    rest=${rest% comment=*}
+    read -r action proto dport dst sport src dir <<<"$rest"
+    dir=${dir:-in}
+
+    # Outbound and forwarding rules say nothing about what can reach us.
+    [ "$dir" = "in" ] || continue
+    case "$action" in
+      allow|limit|deny|reject) ;;
+      *) continue ;;
+    esac
+
+    UFW_RULE_COUNT=$((UFW_RULE_COUNT + 1))
+
+    # ufw writes multiport rules as a comma-separated list.
+    while IFS= read -r part; do
+      [ -z "$part" ] && continue
+      if [ "$part" = "any" ]; then
+        lo=0; hi=65535
+      elif [[ "$part" =~ ^([0-9]+):([0-9]+)$ ]]; then
+        lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
+      elif [[ "$part" =~ ^[0-9]+$ ]]; then
+        lo="$part"; hi="$part"
+      else
+        continue
+      fi
+      UFW_RULES+=("$action|$proto|$lo|$hi|$src|$dst")
+    done < <(tr ',' '\n' <<<"$dport")
+  done < "$file"
+  return 0
+}
 
 collect_firewall() {
   reset_checks
-  local out rule_count=0
+  local v4_ok=1 v6_ok=1
 
-  if ! have ufw; then
+  # Whether ufw is switched on, from its own config rather than its CLI.
+  if [ -r "$UFW_CONF" ]; then
+    grep -qiE '^ENABLED=(yes|true|1)' "$UFW_CONF" && UFW_ENABLED=1
+  fi
+  systemctl is-active --quiet ufw 2>/dev/null && UFW_RUNNING=1
+
+  if [ -r "$UFW_DEFAULTS" ]; then
+    UFW_DEFAULT_IN=$(sed -n 's/^DEFAULT_INPUT_POLICY="\?\([A-Za-z]*\)"\?.*/\1/p' "$UFW_DEFAULTS" | head -1)
+    UFW_DEFAULT_IN=$(tr '[:upper:]' '[:lower:]' <<<"${UFW_DEFAULT_IN:-}")
+  fi
+
+  parse_ufw_rules_file "$UFW_RULES_V4" || v4_ok=0
+  parse_ufw_rules_file "$UFW_RULES_V6" || v6_ok=0
+  [ "$v4_ok" = 1 ] && UFW_READABLE=1
+
+  if ! have ufw && [ "$UFW_READABLE" = 0 ]; then
     add_check "fw.active" "Firewall" "unknown" "ufw is not installed" "sudo pacman -S ufw"
     build_section "ufw not installed"
     return
   fi
 
-  out=$(ufw status verbose 2>/dev/null)
-  if [ -z "$out" ]; then
-    add_check "fw.active" "Firewall" "unknown" "could not read ufw status" "run the collector as root"
-    build_section "ufw status unreadable"
-    return
-  fi
-  UFW_READABLE=1
-
-  if grep -qi '^Status: active' <<<"$out"; then
-    UFW_ACTIVE=1
-    add_check "fw.active" "Firewall" "ok" "ufw is active"
+  if [ "$UFW_ENABLED" = 1 ] && [ "$UFW_RUNNING" = 1 ]; then
+    add_check "fw.active" "Firewall" "ok" "ufw is enabled and running"
+  elif [ "$UFW_ENABLED" = 1 ]; then
+    add_check "fw.active" "Firewall" "fail" \
+      "ufw is configured on but its service is not running" "sudo systemctl start ufw"
+  elif [ "$UFW_RUNNING" = 1 ]; then
+    add_check "fw.active" "Firewall" "warn" \
+      "the ufw service is running but its config says disabled" "sudo ufw enable"
   else
-    add_check "fw.active" "Firewall" "fail" "ufw is inactive" "sudo ufw enable"
+    add_check "fw.active" "Firewall" "fail" "ufw is not enabled" "sudo ufw enable"
   fi
 
-  # "Default: deny (incoming), allow (outgoing), disabled (routed)"
-  local defline
-  defline=$(grep -i '^Default:' <<<"$out" | head -1)
-  if [ -n "$defline" ]; then
-    UFW_DEFAULT_IN=$(sed -n 's/.*Default: *\([a-z]*\) (incoming).*/\1/p' <<<"$defline")
-    case "$UFW_DEFAULT_IN" in
-      deny|reject)
-        add_check "fw.default-incoming" "Default incoming policy" "ok" "$UFW_DEFAULT_IN" ;;
-      allow)
-        add_check "fw.default-incoming" "Default incoming policy" "fail" "allow — every port is open unless a rule denies it" "sudo ufw default deny incoming" ;;
-      *)
-        add_check "fw.default-incoming" "Default incoming policy" "unknown" "could not parse" "" ;;
-    esac
+  case "$UFW_DEFAULT_IN" in
+    drop|reject)
+      add_check "fw.default-incoming" "Default incoming policy" "ok" "$UFW_DEFAULT_IN" ;;
+    accept)
+      add_check "fw.default-incoming" "Default incoming policy" "fail" \
+        "accept — every port is open unless a rule denies it" "sudo ufw default deny incoming" ;;
+    *)
+      add_check "fw.default-incoming" "Default incoming policy" "unknown" \
+        "could not read $UFW_DEFAULTS" "" ;;
+  esac
+
+  if [ "$UFW_READABLE" = 1 ]; then
+    add_check "fw.rules" "Inbound rules" "info" "$UFW_RULE_COUNT rule(s)" ""
+    [ "$v6_ok" = 0 ] && add_check "fw.rules6" "IPv6 rules" "unknown" \
+      "could not read $UFW_RULES_V6" ""
   else
-    add_check "fw.default-incoming" "Default incoming policy" "unknown" "not reported" ""
-  fi
-
-  # Parse ALLOW IN rules into port ranges so listeners can be correlated.
-  local line to from spec lo hi proto
-  while IFS= read -r line; do
-    [[ "$line" != *"ALLOW IN"* ]] && continue
-    rule_count=$((rule_count + 1))
-    to=$(sed 's/ALLOW IN.*//' <<<"$line" | sed 's/ *$//')
-    from=$(sed 's/.*ALLOW IN *//' <<<"$line" | sed 's/ *$//')
-    to=${to//(v6)/}
-    from=${from//(v6)/}
-    to=$(sed 's/ *$//' <<<"$to")
-    from=$(sed 's/ *$//;s/^ *//' <<<"$from")
-    spec=${to##* }
-
-    if [ "$spec" = "Anywhere" ] || [ -z "$spec" ]; then
-      UFW_BLANKET=1
-      UFW_BLANKET_FROM="$from"
-      continue
-    fi
-    if [[ "$spec" =~ ^([0-9]+)(:([0-9]+))?(/(tcp|udp))?$ ]]; then
-      lo="${BASH_REMATCH[1]}"
-      hi="${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}"
-      proto="${BASH_REMATCH[5]:-any}"
-      UFW_RULES+=("$lo:$hi:$proto:$from")
-    else
-      # An application profile ("Samba", "OpenSSH"). We refuse to guess its
-      # ports: an unresolved rule makes exposure "unknown", never "blocked".
-      UFW_UNPARSED=1
-    fi
-  done <<<"$out"
-
-  add_check "fw.rules" "Allow rules" "info" "$rule_count rule line(s)" ""
-  if [ "$UFW_UNPARSED" = 1 ]; then
-    add_check "fw.app-profiles" "Application profile rules" "info" \
-      "present — port correlation falls back to unknown for affected listeners" ""
+    add_check "fw.rules" "Inbound rules" "unknown" \
+      "could not read $UFW_RULES_V4 — exposure cannot be correlated" ""
   fi
 
   local summary
-  if [ "$UFW_ACTIVE" = 1 ]; then
-    summary="active, incoming $UFW_DEFAULT_IN"
+  if [ "$UFW_ENABLED" = 1 ] && [ "$UFW_RUNNING" = 1 ]; then
+    summary="on, incoming ${UFW_DEFAULT_IN:-unknown}"
   else
-    summary="inactive"
+    summary="off"
   fi
   build_section "$summary"
 }
 
-# Does ufw permit inbound <port>/<proto>?  Publishes UFW_VERDICT
-# (allowed|blocked|unknown) and UFW_MATCH_FROM for the allowing rule's
-# source. Globals rather than stdout, for the subshell reason above.
+# Would ufw let an inbound packet reach <port>/<proto> on <listen-address>?
+# Publishes UFW_VERDICT (allowed|blocked|unknown) and UFW_MATCH_FROM.
+# Globals rather than stdout: a command substitution would run this in a
+# subshell and discard the parsed ruleset.
 UFW_MATCH_FROM=""
 UFW_VERDICT="unknown"
 ufw_verdict() {
-  local port="$1" proto="$2" r lo hi rproto rfrom
+  local port="$1" proto="$2" laddr="$3"
+  local r action rproto lo hi src dst
   UFW_MATCH_FROM=""
+
   [ "$UFW_READABLE" = 1 ] || { UFW_VERDICT=unknown; return; }
-  [ "$UFW_ACTIVE" = 1 ] || { UFW_VERDICT=allowed; return; }
+  if [ "$UFW_ENABLED" != 1 ] || [ "$UFW_RUNNING" != 1 ]; then
+    UFW_VERDICT=allowed; UFW_MATCH_FROM="firewall is off"; return
+  fi
 
   for r in ${UFW_RULES+"${UFW_RULES[@]}"}; do
-    IFS=: read -r lo hi rproto rfrom <<<"$r"
+    IFS='|' read -r action rproto lo hi src dst <<<"$r"
+
     [ "$rproto" = "any" ] || [ "$rproto" = "$proto" ] || continue
-    if [ "$port" -ge "$lo" ] && [ "$port" -le "$hi" ]; then
-      UFW_MATCH_FROM="$rfrom"
-      UFW_VERDICT=allowed; return
-    fi
+    [ "$port" -ge "$lo" ] && [ "$port" -le "$hi" ] || continue
+
+    # A rule scoped to one destination address only covers a listener that
+    # actually answers on it — which a wildcard listener does.
+    case "$dst" in
+      0.0.0.0/0|::/0|any) ;;
+      *)
+        [ "$laddr" = "0.0.0.0" ] || [ "$laddr" = "::" ] || [ "$laddr" = "$dst" ] || continue ;;
+    esac
+
+    # First match wins, exactly as ufw applies them.
+    case "$action" in
+      allow|limit)
+        UFW_VERDICT=allowed
+        UFW_MATCH_FROM="$src"
+        case "$dst" in 0.0.0.0/0|::/0|any) ;; *) UFW_MATCH_FROM="$src on $dst" ;; esac
+        return ;;
+      deny|reject)
+        UFW_VERDICT=blocked; return ;;
+    esac
   done
 
-  if [ "$UFW_BLANKET" = 1 ]; then
-    UFW_MATCH_FROM="$UFW_BLANKET_FROM"
-    UFW_VERDICT=allowed; return
-  fi
-  if [ "$UFW_UNPARSED" = 1 ]; then UFW_VERDICT=unknown; return; fi
-
   case "$UFW_DEFAULT_IN" in
-    deny|reject) UFW_VERDICT=blocked ;;
-    allow) UFW_VERDICT=allowed ;;
+    drop|reject) UFW_VERDICT=blocked ;;
+    accept) UFW_VERDICT=allowed; UFW_MATCH_FROM="default policy" ;;
     *) UFW_VERDICT=unknown ;;
   esac
 }
@@ -251,7 +308,7 @@ collect_exposure() {
     fi
 
     case "$scope" in
-      all|specific) ufw_verdict "$port" "$netid"; verdict="$UFW_VERDICT" ;;
+      all|specific) ufw_verdict "$port" "$netid" "$addr"; verdict="$UFW_VERDICT" ;;
       *) verdict="n/a"; UFW_MATCH_FROM="" ;;
     esac
 
@@ -302,6 +359,17 @@ collect_exposure() {
       "$orphan_n listener(s) — the address is gone, so nothing can reach them" ""
   fi
   add_check "exp.total" "Listening sockets" "info" "$total total" ""
+
+  if [ "$PRIVILEGED" != 1 ]; then
+    local named unnamed
+    named=$(jq -r '[.[] | select((.process // "") != "")] | length' <<<"$listeners")
+    unnamed=$(( total - named ))
+    if [ "$unnamed" -gt 0 ]; then
+      add_check "exp.attribution" "Process attribution" "info" \
+        "$unnamed socket(s) belong to other users and cannot be named without root" \
+        "enable full checks to name every listening process"
+    fi
+  fi
 
   # sshd is the exposure everyone forgets about, so it gets its own row.
   local ssh_state
@@ -418,10 +486,12 @@ jq -nc \
   --argjson network "$NETWORK" \
   --arg generatedAt "$(date -Is)" \
   --argjson generatedAtUnix "$(date +%s)" \
+  --argjson privileged "$( [ "$PRIVILEGED" = 1 ] && echo true || echo false )" \
   '{
      schemaVersion: 1,
      generatedAt: $generatedAt,
      generatedAtUnix: $generatedAtUnix,
+     privileged: $privileged,
      sections: { firewall: $firewall, exposure: $exposure, network: $network }
    }' > "$TMP"
 

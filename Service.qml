@@ -2,10 +2,16 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Reads what the privileged collectors left in /run and turns it into the
-// shape the panel renders. Deliberately inert: this file never runs a
-// command and never needs a privilege, so opening the panel can never
-// produce an authentication prompt.
+// Supplies the panel with data, from whichever of two sources is fresher.
+//
+// The widget works with nothing installed: it runs the collectors itself, as
+// you, on a timer. Everything that matters is readable without privilege —
+// ufw keeps its ruleset in world-readable files, and the "### tuple ###"
+// lines there are a better source than the root-only CLI output.
+//
+// If the optional system timers are installed, their snapshot in /run is
+// newer and richer (it can name every listening process), so it wins and the
+// self-run stops. Neither path ever asks the panel for a privilege.
 Item {
   id: root
   visible: false
@@ -13,23 +19,50 @@ Item {
   property var settings: ({})
   property int staleAfterSec: 300
 
-  readonly property string runtimeDir: "/run/omarchy-security"
+  readonly property string systemDir: "/run/omarchy-security"
+  readonly property string userDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omarchy-security"
 
-  property var statusDoc: null
-  property var integrityDoc: null
-  property bool statusMissing: true
-  property bool integrityMissing: true
+  readonly property string collectPath: stripScheme(Qt.resolvedUrl("system/omarchy-security-collect"))
+  readonly property string auditPath: stripScheme(Qt.resolvedUrl("system/omarchy-security-audit"))
+  readonly property string installPath: stripScheme(Qt.resolvedUrl("system/install.sh"))
 
-  // Ticks so `ageSec` stays live while the panel is open.
+  function stripScheme(url) { return String(url).replace(/^file:\/\//, "") }
+
+  property var systemStatus: null
+  property var userStatus: null
+  property var systemIntegrity: null
+  property var userIntegrity: null
+
   property int nowUnix: Math.floor(Date.now() / 1000)
+  property int lastSelfAuditUnix: 0
+  property bool selfCollecting: false
+  property bool installing: false
+  property string installError: ""
 
-  readonly property bool collectorInstalled: !statusMissing || !integrityMissing
+  function newer(a, b) {
+    if (!a) return b
+    if (!b) return a
+    return (a.generatedAtUnix || 0) >= (b.generatedAtUnix || 0) ? a : b
+  }
+
+  readonly property var statusDoc: newer(systemStatus, userStatus)
+  readonly property var integrityDoc: newer(systemIntegrity, userIntegrity)
+
+  readonly property bool haveData: statusDoc !== null
+  readonly property bool privileged: statusDoc ? statusDoc.privileged === true : false
+  readonly property bool systemCollectorInstalled: systemStatus !== null
+
   readonly property int generatedAtUnix: statusDoc && statusDoc.generatedAtUnix ? statusDoc.generatedAtUnix : 0
   readonly property int ageSec: generatedAtUnix > 0 ? Math.max(0, nowUnix - generatedAtUnix) : -1
-  readonly property bool stale: collectorInstalled && (ageSec < 0 || ageSec > staleAfterSec)
+  readonly property bool stale: haveData && (ageSec < 0 || ageSec > staleAfterSec)
 
   readonly property int integrityAgeSec: integrityDoc && integrityDoc.generatedAtUnix
     ? Math.max(0, nowUnix - integrityDoc.generatedAtUnix) : -1
+
+  // True while the system snapshot is recent enough that self-running would
+  // only duplicate work.
+  readonly property bool systemFresh: systemStatus !== null
+    && (nowUnix - (systemStatus.generatedAtUnix || 0)) < 150
 
   readonly property var sectionOrder: [
     { key: "firewall", title: "Firewall", source: "status" },
@@ -60,7 +93,8 @@ Item {
       if (!body) {
         out.push({
           key: spec.key, title: spec.title, status: "unknown",
-          summary: "no data", checks: [], listeners: [], missing: true
+          summary: spec.key === "integrity" ? "not collected yet" : "no data",
+          checks: [], listeners: [], missing: true
         })
         continue
       }
@@ -78,11 +112,13 @@ Item {
   }
 
   function worstOf(list) {
-    if (!collectorInstalled) return "unknown"
-    // Data we know to be old is not evidence that things are still fine.
+    if (!haveData) return "unknown"
+    // Data known to be old is not evidence that things are still fine.
     if (stale) return "unknown"
     var best = "ok", bestRank = 0
     for (var i = 0; i < list.length; i++) {
+      // A section that simply has not been collected yet is not a finding.
+      if (list[i].missing && list[i].key === "integrity") continue
       var r = rank(list[i].status)
       if (r > bestRank) { bestRank = r; best = list[i].status }
     }
@@ -101,47 +137,150 @@ Item {
     return n
   }
 
+  function assign(which, parsed) {
+    switch (which) {
+      case "systemStatus": systemStatus = parsed; break
+      case "userStatus": userStatus = parsed; break
+      case "systemIntegrity": systemIntegrity = parsed; break
+      case "userIntegrity": userIntegrity = parsed; break
+    }
+  }
+
   function parseInto(text, which) {
-    var parsed = null
     try {
-      parsed = JSON.parse(String(text || ""))
+      var parsed = JSON.parse(String(text || ""))
+      assign(which, parsed && typeof parsed === "object" ? parsed : null)
     } catch (e) {
       console.warn("omarchy-security", "ignoring unparseable", which, e)
-      parsed = null
-    }
-    if (which === "status") {
-      statusDoc = parsed
-      statusMissing = parsed === null
-    } else {
-      integrityDoc = parsed
-      integrityMissing = parsed === null
+      assign(which, null)
     }
   }
 
+  // ---- collection -------------------------------------------------------
+
+  function collectNow() {
+    if (collectProc.running) return
+    selfCollecting = true
+    collectProc.running = true
+  }
+
+  function auditNow() {
+    if (auditProc.running) return
+    lastSelfAuditUnix = nowUnix
+    auditProc.running = true
+  }
+
+  function refresh() {
+    if (systemCollectorInstalled) {
+      // The units are read-only oneshots and the installed polkit rule lets
+      // wheel start them, so this is prompt-free where it is installed.
+      systemRefreshProc.running = false
+      systemRefreshProc.running = true
+    }
+    collectNow()
+    auditNow()
+  }
+
+  function installSystemCollector() {
+    if (installProc.running) return
+    installError = ""
+    installing = true
+    installProc.running = true
+  }
+
+  Process {
+    id: collectProc
+    // Cheap, but there is no reason for a background check to compete with
+    // anything the user is actually doing.
+    command: ["nice", "-n", "10", root.collectPath]
+    onExited: {
+      root.selfCollecting = false
+      userStatusFile.reload()
+    }
+  }
+
+  Process {
+    id: auditProc
+    // The once-a-day file sweep inside this one checksums every packaged
+    // file, so it is pushed as far down the scheduler as it will go.
+    command: ["nice", "-n", "19", root.auditPath]
+    onExited: userIntegrityFile.reload()
+  }
+
+  Process {
+    id: systemRefreshProc
+    command: ["systemctl", "start",
+              "omarchy-security-collect.service", "omarchy-security-audit.service"]
+  }
+
+  Process {
+    id: installProc
+    // pkexec raises the password dialog through the session's polkit agent,
+    // which Omarchy already runs inside this same shell process.
+    command: ["pkexec", root.installPath]
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.installError = String(text || "").trim()
+    }
+    onExited: function (code) {
+      root.installing = false
+      if (code === 0) {
+        root.installError = ""
+        systemStatusFile.reload()
+        systemIntegrityFile.reload()
+      } else if (root.installError === "") {
+        root.installError = code === 126 || code === 127
+          ? "Cancelled" : "Install failed (exit " + code + ")"
+      }
+    }
+  }
+
+  // ---- sources ----------------------------------------------------------
+
   FileView {
-    id: statusFile
-    path: root.runtimeDir + "/status.json"
+    id: systemStatusFile
+    path: root.systemDir + "/status.json"
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
-    onLoaded: root.parseInto(text(), "status")
-    onLoadFailed: { root.statusDoc = null; root.statusMissing = true }
+    onLoaded: root.parseInto(text(), "systemStatus")
+    onLoadFailed: root.systemStatus = null
   }
 
   FileView {
-    id: integrityFile
-    path: root.runtimeDir + "/integrity.json"
+    id: systemIntegrityFile
+    path: root.systemDir + "/integrity.json"
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
-    onLoaded: root.parseInto(text(), "integrity")
-    onLoadFailed: { root.integrityDoc = null; root.integrityMissing = true }
+    onLoaded: root.parseInto(text(), "systemIntegrity")
+    onLoadFailed: root.systemIntegrity = null
   }
 
-  // The collectors publish by rename, which swaps the inode out from under
-  // the file watcher, so a watch that silently stops watching is the
-  // expected failure rather than a surprising one. Re-read on a slow beat
-  // regardless; it is two small reads from tmpfs.
+  FileView {
+    id: userStatusFile
+    path: root.userDir + "/status.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.parseInto(text(), "userStatus")
+    onLoadFailed: root.userStatus = null
+  }
+
+  FileView {
+    id: userIntegrityFile
+    path: root.userDir + "/integrity.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.parseInto(text(), "userIntegrity")
+    onLoadFailed: root.userIntegrity = null
+  }
+
+  // The collectors publish by rename, which swaps the inode out from under a
+  // file watcher, so re-reading on a slow beat is the expected belt-and-
+  // braces rather than a surprise. This is also where self-collection is
+  // driven from.
   Timer {
     interval: 10000
     repeat: true
@@ -149,8 +288,23 @@ Item {
     triggeredOnStart: true
     onTriggered: {
       root.nowUnix = Math.floor(Date.now() / 1000)
-      statusFile.reload()
-      integrityFile.reload()
+      systemStatusFile.reload()
+      systemIntegrityFile.reload()
+      userStatusFile.reload()
+      userIntegrityFile.reload()
+
+      if (root.systemFresh) return   // the timers have it covered
+
+      var userAge = root.userStatus
+        ? root.nowUnix - (root.userStatus.generatedAtUnix || 0)
+        : 1e9
+      if (userAge >= 60) root.collectNow()
+
+      var integrityAge = root.userIntegrity
+        ? root.nowUnix - (root.userIntegrity.generatedAtUnix || 0)
+        : 1e9
+      if (integrityAge >= 3600 && root.nowUnix - root.lastSelfAuditUnix >= 3600)
+        root.auditNow()
     }
   }
 }

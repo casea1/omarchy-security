@@ -111,7 +111,7 @@ Panel {
 
   readonly property string worst: sec.worst
   readonly property color barIconColor: {
-    if (!sec.collectorInstalled) return Qt.darker(root.barForeground, 1.7)
+    if (!sec.haveData) return Qt.darker(root.barForeground, 1.7)
     switch (worst) {
       case "fail": return root.urgentColor
       case "warn": return root.warnColor
@@ -121,7 +121,7 @@ Panel {
   }
 
   readonly property string heroMeta: {
-    if (!sec.collectorInstalled) return "Collector is not installed"
+    if (!sec.haveData) return sec.selfCollecting ? "Collecting…" : "No data yet"
     if (sec.stale) return "Data is stale — last collected " + relativeAge(sec.ageSec)
     if (sec.issueCount === 0) return "Nothing needs your attention"
     return sec.issueCount + (sec.issueCount === 1 ? " item needs" : " items need") + " your attention"
@@ -156,11 +156,11 @@ Panel {
           color: root.barIconColor
           font.family: root.fontFamily
           font.pixelSize: Style.bar.iconFont
-          opacity: sec.collectorInstalled ? 1.0 : 0.5
+          opacity: sec.haveData ? 1.0 : 0.5
         }
 
         Text {
-          visible: root.showBadge && sec.collectorInstalled && sec.issueCount > 0 && !root.vertical
+          visible: root.showBadge && sec.haveData && sec.issueCount > 0 && !root.vertical
           anchors.right: parent.right
           anchors.top: parent.top
           anchors.rightMargin: -Style.space(3)
@@ -174,7 +174,7 @@ Panel {
       }
     }
     tooltipText: {
-      if (!sec.collectorInstalled) return "Security: collector not installed"
+      if (!sec.haveData) return "Security: collecting…"
       if (sec.stale) return "Security: data is stale"
       return "Security: " + root.statusWord(root.worst)
         + (sec.issueCount > 0 ? " (" + sec.issueCount + ")" : "")
@@ -234,35 +234,82 @@ Panel {
             }
           }
 
-          // Without the privileged half there is nothing to show, so say so
-          // plainly rather than rendering four empty sections.
-          Column {
+          // Nothing installed is a normal, working state — the widget runs
+          // the collectors itself. This is only ever a first-run message.
+          Text {
             width: parent.width
-            spacing: Style.space(4)
-            visible: !sec.collectorInstalled
+            visible: !sec.haveData
+            wrapMode: Text.WordWrap
+            text: sec.selfCollecting
+              ? "Running the first check…"
+              : "Waiting for the first check to run."
+            color: root.dimColor
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
 
-            Text {
-              width: parent.width
-              wrapMode: Text.WordWrap
-              text: "No data in /run/omarchy-security. The collectors run as root on a "
-                    + "systemd timer and this widget only reads what they write."
-              color: root.dimColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
+          // The optional upgrade. Everything that matters already works
+          // without it, so this is worded as an enhancement rather than as a
+          // missing dependency — and it is hidden entirely once taken.
+          Item {
+            id: upgradeRow
+            width: parent.width
+            visible: sec.haveData && !sec.privileged
+            implicitHeight: upgradeText.implicitHeight + Style.space(12)
+
+            Rectangle {
+              anchors.fill: parent
+              radius: Style.space(4)
+              color: upgradeMouse.containsMouse && !sec.installing
+                ? Style.hoverFillFor(root.foreground, Color.accent, root.urgentColor)
+                : Style.normalFillFor(root.foreground, Color.accent, root.urgentColor)
+              border.width: 1
+              border.color: Qt.rgba(root.textColor.r, root.textColor.g, root.textColor.b, 0.18)
             }
-            Text {
-              width: parent.width
-              wrapMode: Text.WordWrap
-              text: "Install them with:  ~/.config/omarchy/plugins/"
-                    + "io.github.caseaustin12.security/system/install.sh"
-              color: root.textColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
+
+            Column {
+              id: upgradeText
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(8)
+              anchors.rightMargin: Style.space(8)
+              spacing: Style.space(2)
+
+              Text {
+                width: parent.width
+                text: sec.installing ? "Authorising…" : "Enable full checks"
+                color: root.textColor
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: sec.installError !== ""
+                  ? sec.installError
+                  : "Names every listening process and completes the file-integrity "
+                    + "sweep. Asks for your password once, then runs on a timer."
+                color: sec.installError !== "" ? root.urgentColor : root.dimColor
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            MouseArea {
+              id: upgradeMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              enabled: !sec.installing
+              cursorShape: Qt.PointingHandCursor
+              onClicked: sec.installSystemCollector()
             }
           }
 
           Repeater {
-            model: sec.collectorInstalled ? sec.sections : []
+            model: sec.haveData ? sec.sections : []
 
             Column {
               id: sectionBlock
@@ -416,12 +463,12 @@ Panel {
           PanelSeparator {
             width: parent.width
             foreground: root.foreground
-            visible: sec.collectorInstalled
+            visible: sec.haveData
           }
 
           Item {
             width: parent.width
-            visible: sec.collectorInstalled
+            visible: sec.haveData
             implicitHeight: footerLeft.implicitHeight
 
             Text {
@@ -431,6 +478,7 @@ Panel {
                     + (sec.integrityAgeSec >= 0
                        ? "  ·  advisories " + root.relativeAge(sec.integrityAgeSec)
                        : "")
+                    + (sec.privileged ? "  ·  full" : "")
               color: root.fainterColor
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption

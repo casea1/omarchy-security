@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# Installs the privileged half of the Omarchy security widget.
+# OPTIONAL. The widget works without any of this.
 #
-# The widget itself is unprivileged QML and needs no installation — it is
-# already in ~/.config/omarchy/plugins. What this puts in place is the root
-# collector that gives it something to read.
+# Everything that matters is already readable without privilege: ufw keeps
+# its ruleset in world-readable files, and the advisory database is a public
+# document. The widget runs the collectors itself, as you, on a timer.
 #
-# Run with sudo:  sudo ./install.sh
+# What this adds:
+#   * names for listening sockets owned by other users (ss needs root)
+#   * a complete file-integrity sweep (a user cannot read every packaged file)
+#   * arch-audit, the reference advisory checker
+#   * collection on a system timer, so data is fresh before you open the panel
+#
+# Safe to re-run; it overwrites in place and is how you pick up updates.
+#
+# Run with sudo:  sudo ./install.sh   (the widget's button does this via pkexec)
 
 set -euo pipefail
 
@@ -51,6 +59,7 @@ systemctl start --no-block omarchy-security-audit.service
 
 echo
 echo "Done. The fast collector runs every 60s, the audit hourly."
+echo "The widget will prefer this snapshot and stop collecting on its own."
 echo "Snapshot: /run/omarchy-security/status.json"
 if [ -r /run/omarchy-security/status.json ]; then
   echo
