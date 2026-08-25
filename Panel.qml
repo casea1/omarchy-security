@@ -162,6 +162,7 @@ Panel {
     id: sec
     settings: root.settings
     staleAfterSec: root.setting("staleAfterSec", 300)
+    notificationsEnabled: root.setting("notifications", true)
   }
 
   readonly property string worst: sec.worst

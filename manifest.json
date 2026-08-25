@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.casea1.security",
   "name": "Security",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Austin Case",
   "license": "MIT",
   "description": "Firewall state, network exposure, and package integrity in the Omarchy bar",
@@ -24,7 +24,9 @@
       "showBadge": true,
       "staleAfterSec": 300,
       "warnColor": "",
-      "showLocalListeners": false
+      "showLocalListeners": false,
+      "notifications": true,
+      "checkAdvisories": true
     },
     "schema": [
       {
@@ -52,6 +54,18 @@
         "type": "bool",
         "label": "List loopback-only listeners in the exposure table",
         "defaultValue": false
+      },
+      {
+        "key": "notifications",
+        "type": "bool",
+        "label": "Notify when a check newly fails (warnings never notify)",
+        "defaultValue": true
+      },
+      {
+        "key": "checkAdvisories",
+        "type": "bool",
+        "label": "Fetch the Arch security advisory database (the only network request this makes)",
+        "defaultValue": true
       }
     ]
   }

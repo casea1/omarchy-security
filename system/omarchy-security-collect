@@ -13,7 +13,7 @@ set -uo pipefail
 # Bumped together with the plugin manifest. The widget compares this
 # against its own version so it can tell you when a plugin update has
 # left a stale copy of this script installed under /usr/local/bin.
-COLLECTOR_VERSION="1.0.0"
+COLLECTOR_VERSION="1.1.0"
 
 # Root writes where every session can read it; an ordinary user writes into
 # their own runtime dir. The widget runs this itself when the system timer
@@ -30,10 +30,37 @@ fi
 
 OUT_DIR="${OMARCHY_SECURITY_RUNTIME:-$DEFAULT_RUNTIME}"
 STATE_DIR="${OMARCHY_SECURITY_STATE:-$DEFAULT_STATE}"
+SELF=$(readlink -f "$0")
 OUT="$OUT_DIR/status.json"
 GW_STATE="$STATE_DIR/gateways.json"
 
 mkdir -p "$OUT_DIR" "$STATE_DIR" 2>/dev/null
+
+GW_STATE_EARLY="$STATE_DIR/gateways.json"
+
+if [ "${1:-}" = "--forget-gateway" ]; then
+  key="${2:-}"
+  if [ -z "$key" ]; then
+    echo "usage: $0 --forget-gateway '<iface>|<gateway-ip>'" >&2
+    exit 1
+  fi
+  if [ ! -f "$GW_STATE_EARLY" ]; then
+    echo "Nothing remembered yet."
+    exit 0
+  fi
+  # Drop only the named network. Deleting the whole file would also forget
+  # every other network this machine has learned, silently disabling the
+  # check everywhere else.
+  if tmp=$(mktemp "$GW_STATE_EARLY.XXXXXX") \
+     && jq -c --arg k "$key" 'del(.[$k])' "$GW_STATE_EARLY" > "$tmp"; then
+    mv "$tmp" "$GW_STATE_EARLY"
+    echo "Forgot $key. It will be re-learned on the next check."
+    exit 0
+  fi
+  rm -f "${tmp:-}"
+  echo "Could not update $GW_STATE_EARLY" >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------- helpers
 
@@ -491,8 +518,9 @@ collect_network() {
         add_check "net.gateway" "Gateway identity" "fail" \
           "gateway MAC changed: $prev -> $mac" \
           "expected after a router swap; otherwise treat this network as hostile" \
-          "$(acts "$(mkact "Accept new gateway" terminal "sudo rm -f $GW_STATE && echo 'Gateway record cleared; it will be re-learned.'")" \
-                  "$(mkact "Show ARP table" terminal "ip neigh show")")"
+          "$(acts "$(mkact "Accept this gateway" terminal \
+                      "${PRIVILEGED:+sudo }$SELF --forget-gateway $(printf '%q' "$key")")" \
+                  "$(mkact "Show ARP table" terminal "ip neigh show $(printf '%q' "$gw")")")"
       else
         add_check "net.gateway" "Gateway identity" "ok" "$mac (unchanged)"
       fi

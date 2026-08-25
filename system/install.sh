@@ -37,6 +37,23 @@ for unit in omarchy-security-collect.service omarchy-security-collect.timer \
   install -Dm644 "$HERE/$unit" "$UNIT_DIR/$unit"
 done
 
+# A root timer has no idea whose desktop it serves, so the widget's own
+# settings would be invisible to it. Record the installing user's shell.json
+# so `checkAdvisories` governs the privileged collector too.
+INVOKER=${PKEXEC_UID:+$(getent passwd "$PKEXEC_UID" | cut -d: -f1)}
+INVOKER=${INVOKER:-${SUDO_USER:-}}
+if [ -n "$INVOKER" ]; then
+  INVOKER_HOME=$(getent passwd "$INVOKER" | cut -d: -f6)
+  if [ -n "$INVOKER_HOME" ]; then
+    echo "==> Pointing the audit timer at $INVOKER's settings"
+    mkdir -p "$UNIT_DIR/omarchy-security-audit.service.d"
+    cat > "$UNIT_DIR/omarchy-security-audit.service.d/config.conf" <<CONF
+[Service]
+Environment=OMARCHY_SECURITY_CONFIG=$INVOKER_HOME/.config/omarchy/shell.json
+CONF
+  fi
+fi
+
 echo "==> Installing polkit rule into $RULE_DIR"
 install -Dm644 "$HERE/49-omarchy-security.rules" "$RULE_DIR/49-omarchy-security.rules"
 

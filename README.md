@@ -56,6 +56,25 @@ marked `↗` open a browser.
 | SSH server enabled | Disable SSH server · Show SSH config |
 | Gateway MAC changed | Accept new gateway · Show ARP table |
 
+## Notifications
+
+You get told when something **newly fails** — the firewall stops, a socket
+becomes reachable, an advisory with an available fix appears. That is the
+whole point of a security widget you do not have to remember to open.
+
+It is deliberately quiet:
+
+- **Failures only.** Warnings never notify. Secure Boot being off is worth a
+  row in the panel, not an interruption.
+- **Transitions only.** The first snapshot after login establishes what was
+  already true and says nothing about it. You are told what *changed*.
+- **Once.** A finding notifies when it appears, not every 60 seconds while it
+  persists. If it clears and comes back, you are told again.
+- **Nothing on untrusted data.** A stale or missing snapshot is not evidence
+  that anything changed, so it stays silent.
+
+Set `notifications: false` to turn them off.
+
 ## Using the panel
 
 The panel shows **problems, not inventory**. Passing checks fold into one
@@ -81,6 +100,29 @@ Set these inline on the widget's entry in `~/.config/omarchy/shell.json`.
 | `staleAfterSec` | `300` | Age at which the snapshot is treated as stale |
 | `warnColor` | `""` | Override the amber used for warnings |
 | `showLocalListeners` | `false` | Include loopback sockets in the expanded exposure table |
+| `notifications` | `true` | Notify when a check newly fails |
+| `checkAdvisories` | `true` | Fetch the Arch advisory database (the only network request) |
+
+## Network access
+
+One request, and you can switch it off.
+
+| | |
+|---|---|
+| **Where** | `https://security.archlinux.org/issues/all.json` |
+| **Why** | the published Arch advisories, to find CVEs affecting installed packages |
+| **How often** | at most every 6 hours; the response is cached on disk |
+| **What is sent** | nothing — a plain GET; your package list never leaves the machine |
+| **Turn it off** | `checkAdvisories: false` |
+
+The comparison happens locally: the advisory list is joined against
+`pacman -Q` using `vercmp`, on your machine. With the check disabled, the
+vulnerability row reports `unknown` rather than pretending to be `ok`, and
+every other check carries on working — none of them touch the network.
+
+If you installed the optional collectors, `checkAdvisories` governs those
+too: `install.sh` points the root timer at your `shell.json` so one setting
+covers both. `OMARCHY_SECURITY_NO_NETWORK=1` also disables it.
 
 ## Optional: full checks
 

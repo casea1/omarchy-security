@@ -11,6 +11,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 systemctl disable --now omarchy-security-collect.timer omarchy-security-audit.timer 2>/dev/null || true
+rm -rf /etc/systemd/system/omarchy-security-audit.service.d
 rm -f /etc/systemd/system/omarchy-security-{collect,audit}.{service,timer}
 rm -f /usr/local/bin/omarchy-security-{collect,audit}
 rm -f /etc/polkit-1/rules.d/49-omarchy-security.rules

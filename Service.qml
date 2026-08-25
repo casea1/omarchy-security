@@ -102,7 +102,69 @@ Item {
     { key: "integrity", title: "Integrity", source: "integrity" }
   ]
 
+  // ---- regression notifications ----------------------------------------
+  // A security widget you have to remember to click is a dashboard, not a
+  // monitor. These fire on transitions only: a check that newly fails.
+  // Never on warnings, never on the state at startup, and never twice for
+  // the same finding.
+  property bool notificationsEnabled: true
+  property var knownFailures: []
+  property bool baselineTaken: false
+
   readonly property var sections: buildSections()
+
+  onSectionsChanged: evaluateRegressions()
+
+  function currentFailures() {
+    var out = []
+    for (var i = 0; i < sections.length; i++) {
+      var checks = sections[i].checks
+      for (var j = 0; j < checks.length; j++) {
+        if (checks[j].status === "fail")
+          out.push({ id: checks[j].id, label: checks[j].label, detail: checks[j].detail })
+      }
+    }
+    return out
+  }
+
+  function evaluateRegressions() {
+    // Say nothing about data we do not trust: a stale or missing snapshot is
+    // not evidence that anything changed.
+    if (!haveData || stale) return
+
+    var current = currentFailures()
+    var ids = current.map(function (f) { return f.id })
+
+    // The first good snapshot establishes what was already true. Announcing
+    // all of it at login would be noise, not news.
+    if (!baselineTaken) {
+      baselineTaken = true
+      knownFailures = ids
+      return
+    }
+
+    var fresh = current.filter(function (f) { return root.knownFailures.indexOf(f.id) < 0 })
+    // Reassigning rather than appending means a failure that clears and later
+    // returns is reported again, which is the point.
+    knownFailures = ids
+
+    if (fresh.length === 0 || !notificationsEnabled) return
+
+    var title, body
+    if (fresh.length === 1) {
+      title = "Security: " + fresh[0].label
+      body = fresh[0].detail || ""
+    } else {
+      title = "Security: " + fresh.length + " new failures"
+      body = fresh.map(function (f) { return f.label }).join(", ")
+    }
+
+    Quickshell.execDetached([
+      "notify-send", "-a", "Omarchy Security", "-u", "critical",
+      "-i", "dialog-warning", title, body
+    ])
+  }
+
   readonly property string worst: worstOf(sections)
   readonly property int issueCount: countIssues(sections)
 
