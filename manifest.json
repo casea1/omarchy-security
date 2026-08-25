@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.caseaustin12.security",
+  "id": "io.github.casea1.security",
   "name": "Security",
   "version": "1.0.0",
   "author": "Austin Case",
   "license": "MIT",
   "description": "Firewall state, network exposure, and package integrity in the Omarchy bar",
-  "homepage": "https://github.com/caseaustin12/omarchy-security",
-  "repository": "https://github.com/caseaustin12/omarchy-security",
+  "homepage": "https://github.com/casea1/omarchy-security",
+  "repository": "https://github.com/casea1/omarchy-security",
   "kinds": [
     "bar-widget"
   ],

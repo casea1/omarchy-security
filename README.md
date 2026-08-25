@@ -94,14 +94,14 @@ never race on a read-modify-write, and the panel reports each one's age.
 Nothing to do. Add it to the bar in `~/.config/omarchy/shell.json`:
 
 ```json
-{ "id": "io.github.caseaustin12.security" }
+{ "id": "io.github.casea1.security" }
 ```
 
 For the optional extras, click **Enable full checks** in the panel (it asks
 for your password once via pkexec), or run it yourself:
 
 ```bash
-sudo ~/.config/omarchy/plugins/io.github.caseaustin12.security/system/install.sh
+sudo ~/.config/omarchy/plugins/io.github.casea1.security/system/install.sh
 ```
 
 It is safe to re-run, and re-running is how you pick up updates to the
@@ -111,7 +111,7 @@ collector scripts. To remove just the privileged half:
 ## Remove
 
 ```bash
-omarchy plugin remove io.github.caseaustin12.security
+omarchy plugin remove io.github.casea1.security
 ```
 
 That removes the widget and its bar entry. If you never clicked **Enable full
@@ -122,7 +122,7 @@ If you did, the privileged half lives outside the plugin directory and
 plugin, while the script is still on disk:
 
 ```bash
-sudo ~/.config/omarchy/plugins/io.github.caseaustin12.security/system/uninstall.sh
+sudo ~/.config/omarchy/plugins/io.github.casea1.security/system/uninstall.sh
 ```
 
 It stops and deletes both timers, both units, `/usr/local/bin/omarchy-security-*`,

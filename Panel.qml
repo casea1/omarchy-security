@@ -20,8 +20,8 @@ import qs.Ui
 // is always a deliberate click.
 Panel {
   id: root
-  moduleName: "io.github.caseaustin12.security"
-  ipcTarget: "io.github.caseaustin12.security"
+  moduleName: "io.github.casea1.security"
+  ipcTarget: "io.github.casea1.security"
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgentColor: bar ? bar.urgent : Color.urgent

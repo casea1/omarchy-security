@@ -1,6 +1,6 @@
 [Unit]
 Description=Omarchy security collector (fast checks)
-Documentation=https://github.com/caseaustin12/omarchy-security
+Documentation=https://github.com/casea1/omarchy-security
 After=network-online.target
 Wants=network-online.target
 
