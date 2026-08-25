@@ -30,10 +30,10 @@ Panel {
   readonly property color dimColor: Qt.rgba(textColor.r, textColor.g, textColor.b, 0.58)
   readonly property color fainterColor: Qt.rgba(textColor.r, textColor.g, textColor.b, 0.34)
 
-  // Omarchy themes carry no "warning" role — only foreground, accent and
-  // urgent — so amber is a plain default, overridable for palettes it fights.
+  // No theme defines a "warning" role, so this comes from the active theme's
+  // `yellow` (see Service.qml), with an explicit setting winning over it.
   readonly property color warnColor: setting("warnColor", "") !== ""
-    ? setting("warnColor", "") : "#d79921"
+    ? setting("warnColor", "") : sec.themeWarnColor
 
   readonly property bool showBadge: setting("showBadge", true)
   readonly property bool showLocalListeners: setting("showLocalListeners", false)

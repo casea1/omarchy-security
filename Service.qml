@@ -19,6 +19,25 @@ Item {
   property var settings: ({})
   property int staleAfterSec: 300
 
+  // Omarchy themes expose only foreground/background/accent/urgent/muted, none
+  // of which means "warning". Every stock theme's colors.toml does carry a
+  // `yellow`, though — the slot each theme reserves for exactly this kind of
+  // caution signal — so read it from there rather than inventing a colour that
+  // fights the palette. Color.qml loads this file once at startup and takes
+  // runtime theme switches over IPC instead, so watching it is on us.
+  readonly property string stateHome:
+    (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state"))
+  readonly property string themePath: stateHome + "/omarchy/current/theme"
+
+  property color themeWarnColor: "#d79921"
+
+  function parseThemeYellow(text) {
+    // colors.toml is a flat key = "#rrggbb" table; a line-anchored match keeps
+    // `yellow` from matching `bright_yellow` or a commented-out line.
+    var m = /^\s*yellow\s*=\s*"([^"]+)"/m.exec(String(text || ""))
+    if (m && m[1]) themeWarnColor = m[1]
+  }
+
   readonly property string systemDir: "/run/omarchy-security"
   readonly property string userDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omarchy-security"
 
@@ -261,6 +280,15 @@ Item {
   }
 
   FileView {
+    id: themeColorsFile
+    path: root.themePath + "/colors.toml"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.parseThemeYellow(text())
+  }
+
+  FileView {
     id: systemStatusFile
     path: root.systemDir + "/status.json"
     watchChanges: true
@@ -315,6 +343,10 @@ Item {
       systemIntegrityFile.reload()
       userStatusFile.reload()
       userIntegrityFile.reload()
+      // `current/theme` is a symlink that retargets on a theme switch, which a
+      // file watcher on the old target never sees. Re-read on the tick so a
+      // theme change lands within ten seconds.
+      themeColorsFile.reload()
 
       if (root.systemFresh) return   // the timers have it covered
 
