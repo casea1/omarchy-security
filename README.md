@@ -108,13 +108,52 @@ It is safe to re-run, and re-running is how you pick up updates to the
 collector scripts. To remove just the privileged half:
 `sudo .../system/uninstall.sh`.
 
+## Reading the panel
+
+The panel shows **problems, not inventory**. Each section prints the checks
+that need attention and folds the rest into one line — `4 checks passed` —
+which you can click to see them. Facts that are not findings (rule counts,
+socket totals, the resolver in use) live in the section summary on the right
+rather than taking a row each.
+
+The exposure table follows the same rule: collapsed, it lists only sockets
+something can actually reach. Expand the section for the full picture.
+
+A check that does not apply is not rendered at all. There is no "Wi-Fi
+encryption: not on Wi-Fi" row, because that is not reassurance, it is noise.
+
+## Actions
+
+Findings carry buttons that do the thing rather than telling you what to
+type. Anything that runs opens in a terminal, so `sudo` can prompt and the
+output stays on screen; the window holds open until you press a key, so a
+command that fails is still readable. Buttons marked `↗` open a browser.
+
+| Finding | Buttons |
+|---|---|
+| Known vulnerabilities | List affected · Advisory details ↗ · Update system |
+| Packaged file integrity | Show what changed · Reinstall packages |
+| Secure Boot disabled | How to enable ↗ · Show boot state |
+| ufw off / incoming allowed | Enable firewall · Deny incoming |
+| Something reachable | Show ufw rules · Show listeners |
+| SSH server enabled | Disable SSH server · Show SSH config |
+| Gateway MAC changed | Accept new gateway · Show ARP table |
+| Kernel replaced on disk | Reboot now (asks first) |
+
+Commands are composed in the collector, from a fixed vocabulary — never
+assembled in the QML from panel state. Package names interpolated into a
+command are filtered to `[A-Za-z0-9@._+-]` first, so nothing that did not
+come from pacman reaches a command line.
+
 ## Interactions
 
 | Input | Action |
 |---|---|
 | left click | open/close the panel |
-| right / middle click | re-run both collectors now |
-| `r` in the panel | re-run both collectors now |
+| right / middle click | re-run the collectors now |
+| click a section header | expand or collapse it |
+| `e` | expand or collapse everything |
+| `r` | re-run the collectors now |
 | `esc` | close |
 
 ## Settings
@@ -126,7 +165,7 @@ Set these inline on the widget's entry in `shell.json`.
 | `showBadge` | `true` | Show a count of warnings beside the shield |
 | `staleAfterSec` | `300` | Age past which the snapshot is treated as stale |
 | `warnColor` | `""` | Override the amber used for warnings |
-| `showLocalListeners` | `false` | Include loopback-only sockets in the exposure table |
+| `showLocalListeners` | `false` | Include loopback-only sockets when the exposure section is expanded |
 
 ## Licence
 

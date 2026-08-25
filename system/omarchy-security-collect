@@ -52,14 +52,33 @@ rank_of() {
 CHECKS_JSON=""
 reset_checks() { CHECKS_JSON=""; }
 
-# add_check <id> <label> <status> <detail> [remedy]
+# add_check <id> <label> <status> <detail> [remedy] [actions-json-array]
 add_check() {
   local obj
   obj=$(jq -nc \
     --arg id "$1" --arg label "$2" --arg status "$3" \
     --arg detail "$4" --arg remedy "${5:-}" \
-    '{id:$id,label:$label,status:$status,detail:$detail,remedy:$remedy}')
+    --argjson actions "${6:-[]}" \
+    '{id:$id,label:$label,status:$status,detail:$detail,remedy:$remedy,actions:$actions}')
   CHECKS_JSON="${CHECKS_JSON}${obj}"$'\n'
+}
+
+# An action the panel offers as a button. `kind` is "terminal" (runs in a
+# terminal window, so sudo can prompt and output stays readable) or "url".
+#
+# Commands are composed here, in the collector, from a fixed vocabulary --
+# never assembled in QML from panel state. Any package name interpolated into
+# one goes through safe_names() first.
+mkact() {
+  jq -nc --arg label "$1" --arg kind "$2" --arg command "$3" \
+    '{label:$label,kind:$kind,command:$command}'
+}
+acts() { [ "$#" -eq 0 ] && { echo '[]'; return; }; printf '%s\n' "$@" | jq -sc '.'; }
+
+# pacman names are [A-Za-z0-9@._+-]; anything else did not come from pacman
+# and has no business being pasted onto a command line.
+safe_names() {
+  tr ' ,' '\n\n' <<<"${1:-}" | grep -E '^[A-Za-z0-9@._+-]+$' | head -12 | tr '\n' ' ' | sed 's/ *$//'
 }
 
 # build_section <summary> [extra-json-object]
@@ -172,12 +191,15 @@ collect_firewall() {
     add_check "fw.active" "Firewall" "ok" "ufw is enabled and running"
   elif [ "$UFW_ENABLED" = 1 ]; then
     add_check "fw.active" "Firewall" "fail" \
-      "ufw is configured on but its service is not running" "sudo systemctl start ufw"
+      "ufw is configured on but its service is not running" "sudo systemctl start ufw" \
+      "$(acts "$(mkact "Start ufw" terminal "sudo systemctl enable --now ufw")")"
   elif [ "$UFW_RUNNING" = 1 ]; then
     add_check "fw.active" "Firewall" "warn" \
-      "the ufw service is running but its config says disabled" "sudo ufw enable"
+      "the ufw service is running but its config says disabled" "sudo ufw enable" \
+      "$(acts "$(mkact "Enable firewall" terminal "sudo ufw enable")")"
   else
-    add_check "fw.active" "Firewall" "fail" "ufw is not enabled" "sudo ufw enable"
+    add_check "fw.active" "Firewall" "fail" "ufw is not enabled" "sudo ufw enable" \
+      "$(acts "$(mkact "Enable firewall" terminal "sudo ufw enable")")"
   fi
 
   case "$UFW_DEFAULT_IN" in
@@ -185,14 +207,14 @@ collect_firewall() {
       add_check "fw.default-incoming" "Default incoming policy" "ok" "$UFW_DEFAULT_IN" ;;
     accept)
       add_check "fw.default-incoming" "Default incoming policy" "fail" \
-        "accept — every port is open unless a rule denies it" "sudo ufw default deny incoming" ;;
+        "accept — every port is open unless a rule denies it" "sudo ufw default deny incoming" \
+        "$(acts "$(mkact "Deny incoming" terminal "sudo ufw default deny incoming")")" ;;
     *)
       add_check "fw.default-incoming" "Default incoming policy" "unknown" \
         "could not read $UFW_DEFAULTS" "" ;;
   esac
 
   if [ "$UFW_READABLE" = 1 ]; then
-    add_check "fw.rules" "Inbound rules" "info" "$UFW_RULE_COUNT rule(s)" ""
     [ "$v6_ok" = 0 ] && add_check "fw.rules6" "IPv6 rules" "unknown" \
       "could not read $UFW_RULES_V6" ""
   else
@@ -202,7 +224,7 @@ collect_firewall() {
 
   local summary
   if [ "$UFW_ENABLED" = 1 ] && [ "$UFW_RUNNING" = 1 ]; then
-    summary="on, incoming ${UFW_DEFAULT_IN:-unknown}"
+    summary="on · ${UFW_DEFAULT_IN:-?} incoming · $UFW_RULE_COUNT rules"
   else
     summary="off"
   fi
@@ -343,7 +365,9 @@ collect_exposure() {
       ((if (.process // "") == "" then "unnamed process" else .process end)
        + " on " + .proto + "/" + (.port|tostring))] | unique | join(", ")' <<<"$listeners")
     add_check "exp.reachable" "Reachable from the network" "fail" \
-      "$exposed listener(s): $detail" "close the port or drop the ufw allow rule"
+      "$exposed listener(s): $detail" "close the port or drop the ufw allow rule" \
+      "$(acts "$(mkact "Show ufw rules" terminal "sudo ufw status numbered")" \
+              "$(mkact "Show listeners" terminal "sudo ss -tulnp")")"
   elif [ "$unknown_n" -gt 0 ]; then
     add_check "exp.reachable" "Reachable from the network" "unknown" \
       "no listener is known to be reachable, but $unknown_n could not be checked" ""
@@ -351,10 +375,6 @@ collect_exposure() {
     add_check "exp.reachable" "Reachable from the network" "ok" "nothing inbound is permitted"
   fi
 
-  if [ "$open_blocked" -gt 0 ]; then
-    add_check "exp.firewalled" "Bound to all interfaces but firewalled" "info" \
-      "$open_blocked listener(s) — the firewall is what is stopping them" ""
-  fi
   if [ "$unknown_n" -gt 0 ]; then
     add_check "exp.uncorrelated" "Listeners with an unresolved rule" "unknown" \
       "$unknown_n listener(s) could not be matched against ufw rules" ""
@@ -363,7 +383,6 @@ collect_exposure() {
     add_check "exp.orphan" "Bound to a vanished interface" "info" \
       "$orphan_n listener(s) — the address is gone, so nothing can reach them" ""
   fi
-  add_check "exp.total" "Listening sockets" "info" "$total total" ""
 
   if [ "$PRIVILEGED" != 1 ]; then
     local named unnamed
@@ -382,7 +401,9 @@ collect_exposure() {
   if [ "$ssh_state" = "enabled" ]; then
     if systemctl is-active --quiet sshd 2>/dev/null; then
       add_check "exp.sshd" "SSH server" "warn" "sshd is enabled and running" \
-        "omarchy remove security sshd (if you do not need it)"
+        "omarchy remove security sshd (if you do not need it)" \
+        "$(acts "$(mkact "Disable SSH server" terminal "omarchy remove security sshd")" \
+                "$(mkact "Show SSH config" terminal "sudo sshd -T | less")")"
     else
       add_check "exp.sshd" "SSH server" "warn" "sshd is enabled but not running" ""
     fi
@@ -391,9 +412,9 @@ collect_exposure() {
   fi
 
   local summary
-  if [ "$exposed" -gt 0 ]; then summary="$exposed reachable"
-  elif [ "$unknown_n" -gt 0 ]; then summary="$unknown_n unresolved"
-  else summary="nothing reachable"; fi
+  if [ "$exposed" -gt 0 ]; then summary="$exposed reachable · $total listening"
+  elif [ "$unknown_n" -gt 0 ]; then summary="$unknown_n unresolved · $total listening"
+  else summary="none reachable · $total listening"; fi
   build_section "$summary" "$(jq -nc --argjson l "$listeners" '{listeners:$l}')"
 }
 
@@ -429,9 +450,9 @@ collect_network() {
     else
       add_check "net.wifi" "Wi-Fi encryption" "ok" "\"$ssid\" — $security"
     fi
-  else
-    add_check "net.wifi" "Wi-Fi encryption" "info" "not on Wi-Fi" ""
   fi
+  # No row at all when there is no Wi-Fi: an inapplicable check is noise, not
+  # reassurance.
 
   # DNS resolvers and transport.
   if have resolvectl; then
@@ -444,7 +465,8 @@ collect_network() {
       add_check "net.dot" "DNS over TLS" "ok" "on"
     else
       add_check "net.dot" "DNS over TLS" "info" "off — DNS queries are sent in the clear" \
-        "set DNSOverTLS=yes in /etc/systemd/resolved.conf"
+        "set DNSOverTLS=yes in /etc/systemd/resolved.conf" \
+        "$(acts "$(mkact "Edit resolved.conf" terminal "sudoedit /etc/systemd/resolved.conf")")"
     fi
   else
     add_check "net.dns" "DNS resolver" "unknown" "systemd-resolved not available" ""
@@ -468,14 +490,16 @@ collect_network() {
       elif [ "$prev" != "$mac" ]; then
         add_check "net.gateway" "Gateway identity" "fail" \
           "gateway MAC changed: $prev -> $mac" \
-          "expected after a router swap; otherwise treat this network as hostile"
+          "expected after a router swap; otherwise treat this network as hostile" \
+          "$(acts "$(mkact "Accept new gateway" terminal "sudo rm -f $GW_STATE && echo 'Gateway record cleared; it will be re-learned.'")" \
+                  "$(mkact "Show ARP table" terminal "ip neigh show")")"
       else
         add_check "net.gateway" "Gateway identity" "ok" "$mac (unchanged)"
       fi
     fi
   fi
 
-  build_section "${dev:-offline}"
+  build_section "${dev:-offline}${dns:+ · $dns}"
 }
 
 # ---------------------------------------------------------------- assemble
