@@ -19,6 +19,31 @@ the panel tells you what that thing is — and offers to fix it.
 | **Network** | Wi-Fi encryption, DNS resolver and DoT, gateway MAC changes |
 | **Integrity** | Arch security advisories, modified packaged files, Secure Boot, disk encryption, pending kernel reboot |
 
+## Requirements
+
+Everything needed ships with a default Omarchy install — there is nothing to
+install first.
+
+| Used for | Comes from |
+|---|---|
+| `jq`, `curl` | reading snapshots, fetching advisories | 
+| `ip`, `ss` | routes, gateways, listening sockets (iproute2) |
+| `nmcli`, `resolvectl` | connection type, Wi-Fi security, DNS |
+| `systemctl`, `bootctl` | service state, Secure Boot |
+| `pacman`, `vercmp` | installed packages, version comparison |
+| `findmnt`, `lsblk` | root filesystem and LUKS detection |
+| `notify-send` | regression notifications (libnotify) |
+| `ufw` | its config files are read, never the command |
+
+**Optional:** `arch-audit`, the reference advisory checker. The optional
+installer adds it, but nothing depends on it — the built-in fallback computes
+the same result from the public advisory database and was verified to report
+an identical package set.
+
+Anything missing degrades to an `unknown` row rather than breaking the panel
+or being silently reported as fine. `ufw` absent, no network, a read that
+fails — each says so.
+
 ## Install
 
 ```bash
