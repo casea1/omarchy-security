@@ -108,6 +108,66 @@ It is safe to re-run, and re-running is how you pick up updates to the
 collector scripts. To remove just the privileged half:
 `sudo .../system/uninstall.sh`.
 
+## Remove
+
+```bash
+omarchy plugin remove io.github.caseaustin12.security
+```
+
+That removes the widget and its bar entry. If you never clicked **Enable full
+checks**, nothing else was ever installed and you are done.
+
+If you did, the privileged half lives outside the plugin directory and
+`omarchy plugin remove` cannot reach it. Remove it *before* removing the
+plugin, while the script is still on disk:
+
+```bash
+sudo ~/.config/omarchy/plugins/io.github.caseaustin12.security/system/uninstall.sh
+```
+
+It stops and deletes both timers, both units, `/usr/local/bin/omarchy-security-*`,
+the polkit rule, `/run/omarchy-security` and `/var/lib/omarchy-security`. If you
+have already deleted the plugin directory, the same thing by hand:
+
+```bash
+sudo systemctl disable --now omarchy-security-collect.timer omarchy-security-audit.timer
+sudo rm -f /etc/systemd/system/omarchy-security-{collect,audit}.{service,timer} \
+           /usr/local/bin/omarchy-security-{collect,audit} \
+           /etc/polkit-1/rules.d/49-omarchy-security.rules
+sudo systemctl daemon-reload
+sudo rm -rf /run/omarchy-security /var/lib/omarchy-security
+```
+
+`arch-audit`, if the installer added it, is left alone — drop it with
+`omarchy pkg drop arch-audit` if nothing else needs it.
+
+## What this plugin does to your system
+
+Stated plainly, because a security widget asking for a password deserves it.
+
+**Without the optional installer** it writes one JSON snapshot into your own
+runtime directory and reads files. It runs `ufw`-adjacent *reads* only, never
+`ufw` itself. It makes one network request, to `security.archlinux.org`, for
+the public advisory database, cached for six hours. That is all.
+
+**With the installer**, run once via `pkexec`, it adds:
+
+| Path | What |
+|---|---|
+| `/usr/local/bin/omarchy-security-{collect,audit}` | the two collector scripts |
+| `/etc/systemd/system/omarchy-security-*.{service,timer}` | two timers |
+| `/etc/polkit-1/rules.d/49-omarchy-security.rules` | lets `wheel` **start** those two units, nothing else |
+| `arch-audit` | if not already installed |
+
+The polkit rule is deliberately narrow: it grants `start` on two named
+oneshot units to members of `wheel`, and grants nothing else. The collectors
+only read; the single file each writes is a JSON snapshot.
+
+Action buttons run commands in a terminal, where you can see them. Those
+commands are composed inside the collector from a fixed vocabulary — never
+assembled from panel state — and any package name interpolated into one is
+filtered to `[A-Za-z0-9@._+-]` first.
+
 ## Reading the panel
 
 The panel shows **problems, not inventory**. Each section prints the checks
